@@ -2,14 +2,7 @@
 
 [![CI](https://github.com/anomalyco/mcp-oxide/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/mcp-oxide/actions/workflows/ci.yml)
 
-Cloud-agnostic, pluggable MCP Gateway in Rust. Same two-plane shape as
-[`microsoft/mcp-gateway`](https://github.com/microsoft/mcp-gateway) (control
-plane + data plane, adapters, tool router, session-aware routing) — but every
-cloud / IdP / runtime concern is a trait-based provider you can swap
-(Keycloak + GCP, Entra + AKS, Auth0 + EKS, plain Docker + SQLite, …).
-
-> **Status**: Phase 0 (foundations). See [`PLAN.md`](./PLAN.md) for the full
-> roadmap.
+Cloud-agnostic, pluggable MCP Gateway in Rust. Control plane + data plane, adapters, tool router, session-aware routing but every cloud / IdP / runtime concern is a trait-based provider you can swap (Keycloak + GCP, Entra + AKS, Auth0 + EKS, plain Docker + SQLite, …).
 
 ## Quick start
 
@@ -41,8 +34,6 @@ helm install mcp-oxide deploy/helm/mcp-oxide \
 ```
 
 ## Docs
-
-- [`PLAN.md`](./PLAN.md) — implementation plan and architecture
 - [`docs/adr/`](./docs/adr) — architectural decision records
 - [`openapi/mcp-oxide.openapi.yaml`](./openapi/mcp-oxide.openapi.yaml) — API spec
 
