@@ -1,0 +1,20 @@
+[package]
+name = "mcp-oxide-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP JSON-RPC + SSE client, proxy, and tool router"
+
+[lints]
+workspace = true
+
+[dependencies]
+mcp-oxide-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

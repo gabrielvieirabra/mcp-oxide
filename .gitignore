@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+/Cargo.lock.bak
+
+# IDE
+/.idea
+/.vscode
+/*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local state
+*.sqlite
+*.sqlite-journal
+*.db
+/tmp/
+/dist/
+
+# Logs
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example

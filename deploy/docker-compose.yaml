@@ -1,0 +1,17 @@
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: mcp-oxide:dev
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - MCP_OXIDE__SERVER__BIND=0.0.0.0:8080
+      - MCP_OXIDE__LOGS__JSON=false
+      - RUST_LOG=info
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped

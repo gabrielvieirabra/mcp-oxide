@@ -1,0 +1,49 @@
+[package]
+name = "mcp-oxide-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mcp-oxide gateway binary"
+
+[[bin]]
+name = "mcp-oxide"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+mcp-oxide-core.workspace = true
+mcp-oxide-mcp.workspace = true
+mcp-oxide-identity.workspace = true
+mcp-oxide-authz.workspace = true
+mcp-oxide-deployment = { workspace = true, features = ["noop-external"] }
+mcp-oxide-metadata.workspace = true
+mcp-oxide-session.workspace = true
+mcp-oxide-secrets.workspace = true
+mcp-oxide-audit.workspace = true
+mcp-oxide-observability.workspace = true
+
+async-trait.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+figment.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true

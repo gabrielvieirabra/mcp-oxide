@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: "1"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.job }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [fmt, clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ matrix.job }}
+
+      - name: fmt
+        if: matrix.job == 'fmt'
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        if: matrix.job == 'clippy'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        if: matrix.job == 'test'
+        run: cargo test --workspace --all-targets --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.85.0"
+          command: check bans licenses sources advisories
+
+  helm:
+    name: Helm lint / template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.3"
+      - name: helm lint
+        run: |
+          helm lint deploy/helm/mcp-oxide
+          helm lint deploy/helm/mcp-oxide -f deploy/helm/mcp-oxide/values-local.yaml
+          helm lint deploy/helm/mcp-oxide -f deploy/helm/mcp-oxide/values-prod.yaml
+      - name: helm template → kubeconform
+        run: |
+          curl -sSLo kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          helm template test deploy/helm/mcp-oxide -f deploy/helm/mcp-oxide/values-prod.yaml \
+            | ./kubeconform -strict -ignore-missing-schemas -summary -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+  kind-smoke:
+    name: Kubernetes smoke (kind)
+    runs-on: ubuntu-latest
+    needs: [rust, helm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: 1.85.0 }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin mcp-oxide --locked
+
+      - name: Build container image
+        run: docker build -t mcp-oxide:ci -f deploy/Dockerfile .
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: mcp-oxide
+          version: v0.24.0
+
+      - name: Load image into kind
+        run: kind load docker-image mcp-oxide:ci --name mcp-oxide
+
+      - uses: azure/setup-helm@v4
+        with: { version: "v3.16.3" }
+
+      - name: Install chart
+        run: |
+          helm install mcp-oxide deploy/helm/mcp-oxide \
+            --namespace mcp-oxide --create-namespace \
+            -f deploy/helm/mcp-oxide/values-local.yaml \
+            --set image.repository=mcp-oxide --set image.tag=ci --set image.pullPolicy=Never \
+            --wait --timeout 3m
+
+      - name: Helm test
+        run: helm test mcp-oxide -n mcp-oxide --timeout 2m
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          kubectl -n mcp-oxide get all
+          kubectl -n mcp-oxide describe pods
+          kubectl -n mcp-oxide logs -l app.kubernetes.io/name=mcp-oxide --all-containers --tail=200 || true
+
+  trivy:
+    name: Image scan (trivy)
+    runs-on: ubuntu-latest
+    needs: kind-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t mcp-oxide:scan -f deploy/Dockerfile .
+      - name: Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: mcp-oxide:scan
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library

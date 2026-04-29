@@ -1,0 +1,27 @@
+[package]
+name = "mcp-oxide-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Metadata store implementations for mcp-oxide"
+
+[lints]
+workspace = true
+
+[features]
+default = ["in-memory"]
+in-memory = []
+postgres = []
+sqlite = []
+redis = []
+
+[dependencies]
+mcp-oxide-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,0 +1,24 @@
+[package]
+name = "mcp-oxide-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session stores (in-memory, Redis, NATS KV) for mcp-oxide"
+
+[lints]
+workspace = true
+
+[features]
+default = ["in-memory"]
+in-memory = []
+redis = []
+nats-kv = []
+
+[dependencies]
+mcp-oxide-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true

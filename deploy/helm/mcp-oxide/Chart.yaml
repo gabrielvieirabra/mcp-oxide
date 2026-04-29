@@ -1,0 +1,19 @@
+apiVersion: v2
+name: mcp-oxide
+description: "MCP Gateway (Rust, cloud-agnostic, pluggable)"
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/anomalyco/mcp-oxide
+sources:
+  - https://github.com/anomalyco/mcp-oxide
+maintainers:
+  - name: mcp-oxide contributors
+keywords:
+  - mcp
+  - gateway
+  - proxy
+  - reverse-proxy
+annotations:
+  category: AI

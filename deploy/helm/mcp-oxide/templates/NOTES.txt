@@ -1,0 +1,16 @@
+mcp-oxide {{ .Chart.AppVersion }} installed.
+
+1. Wait for the gateway to become ready:
+
+   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "mcp-oxide.fullname" . }}
+
+2. Port-forward and check /healthz:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "mcp-oxide.fullname" . }} {{ .Values.ports.http }}:{{ .Values.ports.http }}
+   curl -sS http://localhost:{{ .Values.ports.http }}/healthz | jq .
+
+3. Docs: https://github.com/anomalyco/mcp-oxide
+
+Providers wired in Phase 0 are all-noop (identity=noop, authz=deny-all).
+Configure real providers via the ConfigMap / `config:` block before using the
+data plane.

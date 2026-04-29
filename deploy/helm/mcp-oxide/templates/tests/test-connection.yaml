@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "mcp-oxide.fullname" . }}-test-connection"
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "mcp-oxide.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -eu
+          URL="http://{{ include "mcp-oxide.fullname" . }}:{{ .Values.ports.http }}/healthz"
+          for i in 1 2 3 4 5; do
+            if curl -fsS "$URL" | grep -q '"status":"ok"'; then
+              echo "healthz OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "healthz failed"; exit 1

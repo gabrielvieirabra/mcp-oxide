@@ -1,0 +1,16 @@
+# Local dev / kind overrides.
+replicaCount: 1
+image:
+  pullPolicy: IfNotPresent
+pdb:
+  enabled: false
+autoscaling:
+  enabled: false
+resources:
+  requests: { cpu: "50m", memory: "64Mi" }
+  limits:   { cpu: "500m", memory: "256Mi" }
+config:
+  server:
+    bind: "0.0.0.0:8080"
+  logs:
+    json: false

@@ -1,0 +1,25 @@
+[package]
+name = "mcp-oxide-deployment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deployment providers (Kubernetes, Docker, Nomad, process, noop-external) for mcp-oxide"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+kubernetes = []
+docker = []
+nomad = []
+process = []
+noop-external = []
+
+[dependencies]
+mcp-oxide-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true

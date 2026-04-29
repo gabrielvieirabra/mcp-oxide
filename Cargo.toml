@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/mcp",
+    "crates/identity",
+    "crates/authz",
+    "crates/deployment",
+    "crates/metadata",
+    "crates/session",
+    "crates/secrets",
+    "crates/audit",
+    "crates/observability",
+    "crates/gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/anomalyco/mcp-oxide"
+homepage = "https://github.com/anomalyco/mcp-oxide"
+authors = ["mcp-oxide contributors"]
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+
+# http / server
+axum = { version = "0.8", features = ["macros", "http2"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout", "limit", "request-id", "sensitive-headers", "util"] }
+hyper = { version = "1", features = ["full"] }
+http = "1"
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+
+# serde / data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# errors
+thiserror = "2"
+anyhow = "1"
+
+# logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
+
+# metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# config
+figment = { version = "0.10", features = ["yaml", "env", "toml"] }
+
+# utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = "1"
+time = { version = "0.3", features = ["serde", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+once_cell = "1"
+parking_lot = "0.12"
+
+# internal
+mcp-oxide-core = { path = "crates/core", version = "0.1.0" }
+mcp-oxide-mcp = { path = "crates/mcp", version = "0.1.0" }
+mcp-oxide-identity = { path = "crates/identity", version = "0.1.0" }
+mcp-oxide-authz = { path = "crates/authz", version = "0.1.0" }
+mcp-oxide-deployment = { path = "crates/deployment", version = "0.1.0" }
+mcp-oxide-metadata = { path = "crates/metadata", version = "0.1.0" }
+mcp-oxide-session = { path = "crates/session", version = "0.1.0" }
+mcp-oxide-secrets = { path = "crates/secrets", version = "0.1.0" }
+mcp-oxide-audit = { path = "crates/audit", version = "0.1.0" }
+mcp-oxide-observability = { path = "crates/observability", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+opt-level = 0

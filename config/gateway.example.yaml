@@ -1,0 +1,35 @@
+# Gateway configuration example.
+# Copy to /etc/mcp-oxide/gateway.yaml (or point MCP_OXIDE_CONFIG at it).
+
+server:
+  bind: "0.0.0.0:8080"
+
+logs:
+  # true = JSON (production); false = pretty (dev).
+  json: false
+
+# Provider wiring will land in Phase 1+. Shown here for reference.
+# providers:
+#   identity:
+#     kind: oidc-generic
+#     config:
+#       issuer: "https://idp.example.com/realms/app"
+#       audiences: ["mcp-gateway"]
+#   authz:
+#     kind: yaml-rbac
+#     config:
+#       path: "/etc/mcp-oxide/policies.yaml"
+#   deployment:
+#     kind: kubernetes
+#     config:
+#       namespace: "mcp-workloads"
+#   metadata_store:
+#     kind: postgres
+#     config: { dsn: "$POSTGRES_DSN" }
+#   session_store:
+#     kind: redis
+#     config: { url: "$REDIS_URL" }
+#   secrets:
+#     kind: env
+#   audit:
+#     sinks: ["stdout"]

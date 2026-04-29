@@ -1,0 +1,20 @@
+version: 1
+default: deny
+rules:
+  - plane: control
+    action: "adapters.read"
+    allow_roles: ["mcp.engineer", "mcp.admin"]
+  - plane: control
+    action: "adapters.*"
+    allow_roles: ["mcp.admin"]
+  - plane: data
+    action: "tools/list"
+    allow_roles: ["*"]
+  - plane: data
+    action: "tools/call"
+    target_tags: ["public"]
+    allow_roles: ["*"]
+  - plane: data
+    action: "tools/call"
+    target_tags: ["mutating"]
+    allow_roles: ["mcp.admin"]

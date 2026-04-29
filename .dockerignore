@@ -1,0 +1,10 @@
+# Files not needed in the docker build context.
+target/
+.git/
+.github/
+docs/
+deploy/k8s/
+deploy/docker-compose.yaml
+tests/load/
+*.md
+.DS_Store
