@@ -9,6 +9,11 @@ use mcp_oxide_core::{
     Result,
 };
 
+#[cfg(feature = "yaml-rbac")]
+pub mod yaml_rbac;
+#[cfg(feature = "yaml-rbac")]
+pub use yaml_rbac::{YamlRbacEngine, YamlRbacPolicy};
+
 /// Denies everything. Default policy engine when nothing is configured.
 #[derive(Debug, Default)]
 pub struct DenyAllPolicyEngine;

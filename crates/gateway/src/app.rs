@@ -1,6 +1,9 @@
-//! Gateway HTTP router (Phase 0: health endpoints only).
+//! Gateway HTTP router.
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use tower_http::request_id::MakeRequestUuid;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tower_http::ServiceBuilderExt;
@@ -16,9 +19,9 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(routes::health::ready))
         .route("/livez", get(routes::health::live))
         .route("/", get(routes::health::root))
+        .route("/adapters/{name}/mcp", post(routes::data_plane::invoke))
         .with_state(state);
 
-    // Standard middleware stack.
     let middleware = tower::ServiceBuilder::new()
         .set_x_request_id(MakeRequestUuid)
         .layer(
@@ -34,7 +37,7 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, LogConfig, ServerConfig};
+    use crate::config::Config;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -42,10 +45,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_ok() {
-        let cfg = Config {
-            server: ServerConfig::default(),
-            logs: LogConfig::default(),
-        };
+        let cfg = Config::default();
         let state = AppState::bootstrap(&cfg).await.unwrap();
         let app = router(state);
 
@@ -67,10 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn readyz_ok() {
-        let cfg = Config {
-            server: ServerConfig::default(),
-            logs: LogConfig::default(),
-        };
+        let cfg = Config::default();
         let state = AppState::bootstrap(&cfg).await.unwrap();
         let app = router(state);
 
@@ -84,5 +81,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_without_token() {
+        let cfg = Config::default();
+        let state = AppState::bootstrap(&cfg).await.unwrap();
+        let app = router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/adapters/anything/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","method":"ping","id":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

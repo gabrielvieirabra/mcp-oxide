@@ -4,11 +4,7 @@
 
 use std::process::ExitCode;
 
-mod app;
-mod config;
-mod error;
-mod routes;
-mod state;
+use mcp_oxide_gateway::{router, AppState, Config};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -22,7 +18,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let cfg = config::Config::load()?;
+    let cfg = Config::load()?;
     mcp_oxide_observability::init_logging(cfg.logs.json);
 
     tracing::info!(
@@ -31,13 +27,13 @@ async fn run() -> anyhow::Result<()> {
         "starting mcp-oxide gateway"
     );
 
-    let state = state::AppState::bootstrap(&cfg).await?;
-    let router = app::router(state);
+    let state = AppState::bootstrap(&cfg).await?;
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    axum::serve(listener, router)
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

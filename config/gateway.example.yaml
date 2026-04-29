@@ -3,33 +3,51 @@
 
 server:
   bind: "0.0.0.0:8080"
+  request_timeout_ms: 30000
+  max_body_bytes: 1048576
 
 logs:
-  # true = JSON (production); false = pretty (dev).
-  json: false
+  json: true  # false for dev (pretty)
 
-# Provider wiring will land in Phase 1+. Shown here for reference.
-# providers:
+providers:
+  identity:
+    # kind: noop | oidc-generic | static-jwt
+    kind: oidc-generic
+    issuer: "https://idp.example.com/realms/app"
+    audiences: ["mcp-gateway"]
+    algorithms: ["RS256", "ES256"]
+    jwks_cache_ttl_s: 300
+    clock_skew_s: 30
+    roles_claim_paths:
+      - "realm_access.roles"
+      - "resource_access.mcp-gateway.roles"
+    groups_claim_paths: ["groups"]
+    tenant_claim_path: "tenant"
+
+  authz:
+    # kind: deny-all | yaml-rbac
+    kind: yaml-rbac
+    path: "/etc/mcp-oxide/policies.yaml"
+
+upstream:
+  connect_timeout_ms: 2000
+  request_timeout_ms: 25000
+  pool_max_idle_per_host: 32
+
+# Static adapters bootstrapped from config. Phase 2 replaces this with CRUD
+# via /adapters backed by a MetadataStore.
+static_adapters:
+  - name: mcp-example
+    upstream: "http://mcp-example:8080/mcp"
+    required_roles: ["mcp.engineer"]
+    tags: ["example"]
+
+# Dev alternative for identity.provider:
+#
 #   identity:
-#     kind: oidc-generic
-#     config:
-#       issuer: "https://idp.example.com/realms/app"
-#       audiences: ["mcp-gateway"]
-#   authz:
-#     kind: yaml-rbac
-#     config:
-#       path: "/etc/mcp-oxide/policies.yaml"
-#   deployment:
-#     kind: kubernetes
-#     config:
-#       namespace: "mcp-workloads"
-#   metadata_store:
-#     kind: postgres
-#     config: { dsn: "$POSTGRES_DSN" }
-#   session_store:
-#     kind: redis
-#     config: { url: "$REDIS_URL" }
-#   secrets:
-#     kind: env
-#   audit:
-#     sinks: ["stdout"]
+#     kind: static-jwt
+#     algorithm: HS256
+#     key_path: /etc/mcp-oxide/jwt.key
+#     issuer: test-iss
+#     audiences: ["mcp-gateway"]
+#     clock_skew_s: 30

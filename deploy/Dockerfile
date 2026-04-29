@@ -2,7 +2,7 @@
 # Multi-stage build for mcp-oxide. Produces a distroless, non-root image
 # containing only the static gateway binary.
 
-ARG RUST_VERSION=1.85
+ARG RUST_VERSION=1.88
 
 # -----------------------------------------------------------------------------
 # Stage 1: cargo-chef recipe (cache workspace dependency graph).

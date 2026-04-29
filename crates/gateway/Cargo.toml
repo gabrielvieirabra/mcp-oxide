@@ -11,14 +11,18 @@ description = "mcp-oxide gateway binary"
 name = "mcp-oxide"
 path = "src/main.rs"
 
+[lib]
+name = "mcp_oxide_gateway"
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 mcp-oxide-core.workspace = true
 mcp-oxide-mcp.workspace = true
-mcp-oxide-identity.workspace = true
-mcp-oxide-authz.workspace = true
+mcp-oxide-identity = { workspace = true, features = ["oidc-generic", "static-jwt"] }
+mcp-oxide-authz = { workspace = true, features = ["yaml-rbac"] }
 mcp-oxide-deployment = { workspace = true, features = ["noop-external"] }
 mcp-oxide-metadata.workspace = true
 mcp-oxide-session.workspace = true
@@ -43,7 +47,17 @@ tracing-subscriber.workspace = true
 figment.workspace = true
 uuid.workspace = true
 time.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+jsonwebtoken.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net"] }
