@@ -1,5 +1,6 @@
 //! Registered MCP server (Adapter) domain model.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -10,6 +11,12 @@ pub struct Adapter {
     pub description: Option<String>,
     pub image: ImageRef,
     pub endpoint: Endpoint,
+    /// Optional explicit upstream URL. When set, the data plane proxies to
+    /// this URL directly. When unset, the `DeploymentProvider` (Phase 3+) is
+    /// queried for endpoints. Useful for `noop-external` mode where the
+    /// adapter is already running somewhere reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
     #[serde(default = "one")]
     pub replicas: u32,
     #[serde(default)]
@@ -28,6 +35,12 @@ pub struct Adapter {
     pub session_affinity: SessionAffinity,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 fn one() -> u32 {

@@ -13,15 +13,17 @@ use mcp_oxide_core::providers::{
     SessionStore,
 };
 use mcp_oxide_deployment::NoopExternalProvider;
+#[cfg(feature = "docker")]
+use mcp_oxide_deployment::DockerProvider;
 use mcp_oxide_identity::{
     claims::ClaimExtractor, NoopIdProvider, OidcConfig, OidcProvider, StaticJwtConfig,
     StaticJwtProvider,
 };
-use mcp_oxide_metadata::InMemoryMetadataStore;
+use mcp_oxide_metadata::{InMemoryMetadataStore, SqliteMetadataStore};
 use mcp_oxide_secrets::EnvSecretProvider;
 use mcp_oxide_session::InMemorySessionStore;
 
-use crate::config::{AuthzConfig, Config, IdentityConfig, StaticAdapter};
+use crate::config::{AuthzConfig, Config, DeploymentConfig, IdentityConfig, MetadataStoreConfig, StaticAdapter};
 
 /// Static adapter entry resolved to an upstream URL + policy metadata.
 #[derive(Debug, Clone)]
@@ -76,6 +78,8 @@ impl AppState {
     pub async fn bootstrap(cfg: &Config) -> anyhow::Result<Self> {
         let identity = build_identity(cfg).await?;
         let authz = build_authz(cfg)?;
+        let metadata = build_metadata(cfg).await?;
+        let deployment = build_deployment(cfg).await?;
 
         let http = reqwest::Client::builder()
             .connect_timeout(cfg.upstream.connect_timeout())
@@ -92,8 +96,8 @@ impl AppState {
         let s = Self {
             identity,
             authz,
-            deployment: Arc::new(NoopExternalProvider),
-            metadata: Arc::new(InMemoryMetadataStore::new()),
+            deployment,
+            metadata,
             session: Arc::new(InMemorySessionStore::new()),
             secrets: Arc::new(EnvSecretProvider),
             audit: Arc::new(StdoutAuditSink),
@@ -133,6 +137,29 @@ impl AppState {
             "audit":      self.audit.kind(),
             "static_adapters": self.adapters.len(),
         })
+    }
+
+    /// Resolve an adapter by name. Static config takes precedence; falls back
+    /// to the `MetadataStore` so runtime-registered adapters are routable
+    /// without a restart.
+    pub async fn resolve_adapter(&self, name: &str) -> anyhow::Result<Option<ResolvedAdapter>> {
+        if let Some(a) = self.adapters.get(name) {
+            return Ok(Some(a.clone()));
+        }
+        if let Some(a) = self.metadata.get_adapter(name).await? {
+            let Some(upstream) = a.upstream.clone() else {
+                // Without DeploymentProvider (Phase 3) and no explicit
+                // upstream URL, there is nowhere to route to.
+                return Ok(None);
+            };
+            return Ok(Some(ResolvedAdapter {
+                name: a.name,
+                upstream,
+                required_roles: a.required_roles,
+                tags: a.tags,
+            }));
+        }
+        Ok(None)
     }
 }
 
@@ -275,5 +302,40 @@ fn build_authz(cfg: &Config) -> anyhow::Result<Arc<dyn PolicyEngine>> {
     Ok(match &cfg.providers.authz {
         AuthzConfig::DenyAll => Arc::new(DenyAllPolicyEngine),
         AuthzConfig::YamlRbac { path } => Arc::new(YamlRbacEngine::from_path(path)?),
+    })
+}
+
+async fn build_metadata(cfg: &Config) -> anyhow::Result<Arc<dyn MetadataStore>> {
+    Ok(match &cfg.providers.metadata_store {
+        MetadataStoreConfig::InMemory => Arc::new(InMemoryMetadataStore::new()),
+        MetadataStoreConfig::Sqlite { path } => {
+            let url = if path.starts_with("sqlite:") {
+                path.clone()
+            } else {
+                format!("sqlite://{path}?mode=rwc")
+            };
+            Arc::new(SqliteMetadataStore::connect(&url).await?)
+        }
+        MetadataStoreConfig::Postgres { .. } => {
+            anyhow::bail!("postgres metadata store is not yet implemented (Phase 2 scope: sqlite)")
+        }
+    })
+}
+
+async fn build_deployment(cfg: &Config) -> anyhow::Result<Arc<dyn DeploymentProvider>> {
+    Ok(match &cfg.providers.deployment {
+        DeploymentConfig::NoopExternal => Arc::new(NoopExternalProvider),
+        #[cfg(feature = "docker")]
+        DeploymentConfig::Docker { socket, network } => {
+            let config = mcp_oxide_deployment::DockerConfig {
+                socket: socket.clone(),
+                network: network.clone(),
+            };
+            Arc::new(DockerProvider::new(config).await?)
+        }
+        #[cfg(not(feature = "docker"))]
+        DeploymentConfig::Docker { .. } => {
+            anyhow::bail!("docker deployment provider requires 'docker' feature")
+        }
     })
 }

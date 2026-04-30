@@ -287,30 +287,52 @@ components:
 
     Adapter:
       type: object
-      required: [name, image, endpoint]
+      required: [name, image]
       properties:
         name:             { type: string }
         description:      { type: string }
-        image:            { $ref: "#/components/schemas/ImageRef" }
-        endpoint:         { $ref: "#/components/schemas/Endpoint" }
+        image:            { type: string, description: "OCI image reference" }
+        endpoint_port:    { type: integer, default: 8080 }
+        endpoint_path:    { type: string, default: "/mcp" }
         replicas:         { type: integer, minimum: 0, default: 1 }
         env:
           type: array
           items: { $ref: "#/components/schemas/EnvVar" }
+        secret_refs:
+          type: array
+          items: { $ref: "#/components/schemas/SecretRef" }
         required_roles:   { type: array, items: { type: string } }
         tags:             { type: array, items: { type: string } }
+        resources:        { $ref: "#/components/schemas/Resources" }
+        health:           { $ref: "#/components/schemas/HealthProbe" }
+        session_affinity: { type: string, enum: [sticky, none], default: sticky }
+        labels:           { type: object, additionalProperties: { type: string } }
+        revision:         { type: integer, description: "Optimistic concurrency version" }
+        created_at:       { type: string, format: date-time }
+        updated_at:       { type: string, format: date-time }
 
     Tool:
       type: object
-      required: [name, image, endpoint, tool_definition]
+      required: [name, image, tool_definition]
       properties:
-        name:            { type: string }
-        description:     { type: string }
-        image:           { $ref: "#/components/schemas/ImageRef" }
-        endpoint:        { $ref: "#/components/schemas/Endpoint" }
-        tool_definition: { $ref: "#/components/schemas/ToolDefinition" }
-        required_roles:  { type: array, items: { type: string } }
-        tags:            { type: array, items: { type: string } }
+        name:             { type: string }
+        description:      { type: string }
+        image:            { type: string, description: "OCI image reference" }
+        endpoint_port:    { type: integer, default: 8080 }
+        endpoint_path:    { type: string, default: "/mcp" }
+        tool_definition:  { $ref: "#/components/schemas/ToolDefinition" }
+        env:
+          type: array
+          items: { $ref: "#/components/schemas/EnvVar" }
+        secret_refs:
+          type: array
+          items: { $ref: "#/components/schemas/SecretRef" }
+        required_roles:   { type: array, items: { type: string } }
+        tags:             { type: array, items: { type: string } }
+        resources:        { $ref: "#/components/schemas/Resources" }
+        revision:         { type: integer, description: "Optimistic concurrency version" }
+        created_at:       { type: string, format: date-time }
+        updated_at:       { type: string, format: date-time }
 
     ImageRef:
       type: object
@@ -331,6 +353,27 @@ components:
       properties:
         name:  { type: string }
         value: { type: string }
+
+    SecretRef:
+      type: object
+      required: [name, provider, key]
+      properties:
+        name:     { type: string }
+        provider: { type: string }
+        key:      { type: string }
+
+    Resources:
+      type: object
+      properties:
+        cpu:    { type: string, example: "500m" }
+        memory: { type: string, example: "512Mi" }
+
+    HealthProbe:
+      type: object
+      required: [path, port]
+      properties:
+        path: { type: string }
+        port: { type: integer }
 
     ToolDefinition:
       type: object

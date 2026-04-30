@@ -73,6 +73,19 @@ pub struct ProvidersConfig {
     pub identity: IdentityConfig,
     #[serde(default)]
     pub authz: AuthzConfig,
+    #[serde(default)]
+    pub metadata_store: MetadataStoreConfig,
+    #[serde(default)]
+    pub deployment: DeploymentConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MetadataStoreConfig {
+    #[default]
+    InMemory,
+    Postgres { dsn: String },
+    Sqlite { path: String },
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -155,6 +168,27 @@ pub enum AuthzConfig {
     YamlRbac {
         path: PathBuf,
     },
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum DeploymentConfig {
+    #[default]
+    NoopExternal,
+    Docker {
+        #[serde(default = "default_docker_socket")]
+        socket: String,
+        #[serde(default = "default_docker_network")]
+        network: String,
+    },
+}
+
+fn default_docker_socket() -> String {
+    "/var/run/docker.sock".into()
+}
+
+fn default_docker_network() -> String {
+    "mcp-oxide".into()
 }
 
 // -------- Upstream ---------------------------------------------------------

@@ -1,7 +1,7 @@
 //! Gateway HTTP router.
 
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use tower_http::request_id::MakeRequestUuid;
@@ -11,15 +11,37 @@ use tower_http::ServiceBuilderExt;
 use crate::{routes, state::AppState};
 
 pub fn router(state: AppState) -> Router {
-    let api = Router::new()
+    let health = Router::new()
         .route("/healthz", get(routes::health::healthz))
         .route("/healthz/startup", get(routes::health::startup))
         .route("/healthz/live", get(routes::health::live))
         .route("/healthz/ready", get(routes::health::ready))
         .route("/readyz", get(routes::health::ready))
         .route("/livez", get(routes::health::live))
-        .route("/", get(routes::health::root))
+        .route("/", get(routes::health::root));
+
+    let control_plane = Router::new()
+        .route("/adapters", get(routes::control_plane::list_adapters))
+        .route("/adapters", post(routes::control_plane::create_adapter))
+        .route("/adapters/{name}", get(routes::control_plane::get_adapter))
+        .route("/adapters/{name}", put(routes::control_plane::update_adapter))
+        .route("/adapters/{name}", delete(routes::control_plane::delete_adapter))
+        .route("/adapters/{name}/status", get(routes::control_plane::get_adapter_status))
+        .route("/tools", get(routes::control_plane::list_tools))
+        .route("/tools", post(routes::control_plane::create_tool))
+        .route("/tools/{name}", get(routes::control_plane::get_tool))
+        .route("/tools/{name}", put(routes::control_plane::update_tool))
+        .route("/tools/{name}", delete(routes::control_plane::delete_tool))
+        .route("/tools/{name}/status", get(routes::control_plane::get_tool_status));
+
+    let data_plane = Router::new()
         .route("/adapters/{name}/mcp", post(routes::data_plane::invoke))
+        .route("/mcp", post(routes::tool_router::invoke));
+
+    let api = Router::new()
+        .merge(health)
+        .merge(control_plane)
+        .merge(data_plane)
         .with_state(state);
 
     let middleware = tower::ServiceBuilder::new()

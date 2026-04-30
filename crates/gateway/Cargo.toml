@@ -18,13 +18,17 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["docker"]
+docker = ["mcp-oxide-deployment/docker"]
+
 [dependencies]
 mcp-oxide-core.workspace = true
 mcp-oxide-mcp.workspace = true
 mcp-oxide-identity = { workspace = true, features = ["oidc-generic", "static-jwt"] }
 mcp-oxide-authz = { workspace = true, features = ["yaml-rbac"] }
 mcp-oxide-deployment = { workspace = true, features = ["noop-external"] }
-mcp-oxide-metadata.workspace = true
+mcp-oxide-metadata = { workspace = true, features = ["in-memory", "sqlite"] }
 mcp-oxide-session.workspace = true
 mcp-oxide-secrets.workspace = true
 mcp-oxide-audit.workspace = true
@@ -47,6 +51,7 @@ tracing-subscriber.workspace = true
 figment.workspace = true
 uuid.workspace = true
 time.workspace = true
+chrono.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
 http.workspace = true

@@ -29,6 +29,11 @@ providers:
     kind: yaml-rbac
     path: "/etc/mcp-oxide/policies.yaml"
 
+  metadata_store:
+    # kind: in-memory | sqlite | postgres
+    kind: sqlite
+    path: "/var/lib/mcp-oxide/store.db"
+
 upstream:
   connect_timeout_ms: 2000
   request_timeout_ms: 25000

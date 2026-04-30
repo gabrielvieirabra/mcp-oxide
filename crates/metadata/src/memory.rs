@@ -97,6 +97,7 @@ mod tests {
                 port: 8080,
                 path: "/mcp".into(),
             },
+            upstream: None,
             replicas: 1,
             env: vec![],
             secret_refs: vec![],
@@ -106,6 +107,9 @@ mod tests {
             health: None,
             session_affinity: Default::default(),
             labels: Default::default(),
+            revision: None,
+            created_at: None,
+            updated_at: None,
         }
     }
 

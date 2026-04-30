@@ -32,26 +32,37 @@ pub async fn invoke(
         .and_then(|v| v.to_str().ok())
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned);
 
-    // Resolve adapter.
-    let Some(adapter) = state.adapters.get(&name).cloned() else {
-        emit_audit(
-            &state,
-            &trace_id,
-            &user,
-            "mcp.invoke",
-            ("adapter", name.as_str()),
-            AuditDecision::Deny,
-            None,
-            0,
-            "not_found",
-            Some("adapter not found"),
-        )
-        .await;
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "not_found", "message": "adapter not found" })),
-        )
-            .into_response();
+    // Resolve adapter from static config or MetadataStore.
+    let adapter = match state.resolve_adapter(&name).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            emit_audit(
+                &state,
+                &trace_id,
+                &user,
+                "mcp.invoke",
+                ("adapter", name.as_str()),
+                AuditDecision::Deny,
+                None,
+                0,
+                "not_found",
+                Some("adapter not found"),
+            )
+            .await;
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "not_found", "message": "adapter not found" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error=%e, "metadata lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal_error", "message": "metadata" })),
+            )
+                .into_response();
+        }
     };
 
     // Extract JSON-RPC method for policy evaluation (best-effort — invalid

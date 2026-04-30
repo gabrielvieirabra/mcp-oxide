@@ -13,8 +13,8 @@ workspace = true
 [features]
 default = ["in-memory"]
 in-memory = []
-postgres = []
-sqlite = []
+postgres = ["sqlx", "sqlx/postgres"]
+sqlite = ["sqlx", "sqlx/sqlite"]
 redis = []
 
 [dependencies]
@@ -22,6 +22,12 @@ mcp-oxide-core.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "chrono", "macros", "json"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+uuid = { workspace = true }

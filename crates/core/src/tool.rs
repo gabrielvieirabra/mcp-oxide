@@ -1,6 +1,7 @@
 //! Registered Tool domain model.
 
 use crate::adapter::{Endpoint, EnvVar, ImageRef, Resources, SecretRef};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,12 @@ pub struct Tool {
     pub tags: Vec<String>,
     #[serde(default)]
     pub resources: Resources,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// MCP tool definition (subset aligned with `tools/call` input).

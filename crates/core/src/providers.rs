@@ -122,6 +122,106 @@ pub trait MetadataStore: Send + Sync {
     fn kind(&self) -> &'static str;
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CreateAdapterRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub image: String,
+    pub endpoint_port: u16,
+    pub endpoint_path: Option<String>,
+    pub replicas: Option<u32>,
+    pub env: Vec<EnvVarEntry>,
+    pub secret_refs: Vec<SecretRefEntry>,
+    pub required_roles: Vec<String>,
+    pub tags: Vec<String>,
+    pub resources: Option<ResourcesSpec>,
+    pub health: Option<HealthProbeSpec>,
+    pub session_affinity: Option<String>,
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateToolRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub image: String,
+    pub endpoint_port: u16,
+    pub endpoint_path: Option<String>,
+    pub tool_definition: ToolDefinitionSpec,
+    pub env: Vec<EnvVarEntry>,
+    pub secret_refs: Vec<SecretRefEntry>,
+    pub required_roles: Vec<String>,
+    pub tags: Vec<String>,
+    pub resources: Option<ResourcesSpec>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateAdapterRequest {
+    pub description: Option<String>,
+    pub image: Option<String>,
+    pub endpoint_port: Option<u16>,
+    pub endpoint_path: Option<String>,
+    pub replicas: Option<u32>,
+    pub env: Option<Vec<EnvVarEntry>>,
+    pub secret_refs: Option<Vec<SecretRefEntry>>,
+    pub required_roles: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    pub resources: Option<ResourcesSpec>,
+    pub health: Option<HealthProbeSpec>,
+    pub session_affinity: Option<String>,
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+    pub revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateToolRequest {
+    pub description: Option<String>,
+    pub image: Option<String>,
+    pub endpoint_port: Option<u16>,
+    pub endpoint_path: Option<String>,
+    pub tool_definition: Option<ToolDefinitionSpec>,
+    pub env: Option<Vec<EnvVarEntry>>,
+    pub secret_refs: Option<Vec<SecretRefEntry>>,
+    pub required_roles: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    pub resources: Option<ResourcesSpec>,
+    pub revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EnvVarEntry {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SecretRefEntry {
+    pub name: String,
+    pub provider: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResourcesSpec {
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HealthProbeSpec {
+    pub path: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolDefinitionSpec {
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+    pub annotations: Option<serde_json::Value>,
+}
+
 // ---------------------------------------------------------------------------
 // Session store
 // ---------------------------------------------------------------------------
