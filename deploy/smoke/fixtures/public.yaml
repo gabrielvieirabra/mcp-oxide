@@ -1,0 +1,23 @@
+# Public, read-only weather tool. Anyone authenticated with role
+# `mcp.viewer` or `mcp.admin` can call it (see policies.yaml).
+name: "mock-weather"
+tools:
+  weather:
+    title: "Weather"
+    description: "Current weather by location."
+    input_schema:
+      type: object
+      properties:
+        location: { type: string }
+      required: [location]
+    annotations:
+      readOnly: true
+    result:
+      content:
+        - type: text
+          text: "sunny, 24C"
+fault:
+  # Fail-open: the gateway must not leak the caller's bearer token upstream.
+  # This flag lets the smoke test `curl` the mock directly and assert a
+  # request did NOT carry Authorization.
+  record_auth_header: true

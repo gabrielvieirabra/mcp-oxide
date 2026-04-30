@@ -1,0 +1,19 @@
+# Admin-only deploy tool. Tagged `admin` in policies.yaml so only
+# `mcp.admin` can call it.
+name: "mock-admin"
+tools:
+  deploy:
+    title: "Deploy"
+    description: "Trigger a deployment (admin only)."
+    input_schema:
+      type: object
+      properties:
+        service: { type: string }
+        version: { type: string }
+      required: [service, version]
+    result:
+      content:
+        - type: text
+          text: "deployment triggered"
+fault:
+  record_auth_header: true

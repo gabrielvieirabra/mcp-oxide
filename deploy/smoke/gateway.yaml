@@ -1,0 +1,40 @@
+server:
+  bind: "0.0.0.0:8080"
+
+logs:
+  json: false
+
+providers:
+  identity:
+    kind: static-jwt
+    algorithm: HS256
+    key_path: /etc/mcp-oxide/jwt.key
+    issuer: mcp-oxide-smoke
+    audiences: ["mcp-oxide"]
+    clock_skew_s: 30
+
+  authz:
+    kind: yaml-rbac
+    path: /etc/mcp-oxide/policies.yaml
+
+  metadata_store:
+    kind: sqlite
+    path: /data/mcp-oxide.db
+
+  # Smoke stack uses noop-external: the mock-mcp containers are brought up
+  # by docker-compose, and adapters are registered pointing at their URLs.
+  deployment:
+    kind: noop-external
+
+upstream:
+  connect_timeout_ms: 2000
+  request_timeout_ms: 10000
+
+# Pre-register one adapter backed by the echo mock so `curl` works
+# against the data plane immediately after boot. Additional adapters
+# can be added at runtime via POST /adapters.
+static_adapters:
+  - name: echo-static
+    upstream: "http://mock-echo:8090/mcp"
+    required_roles: []
+    tags: ["public"]

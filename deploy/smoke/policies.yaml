@@ -1,0 +1,47 @@
+version: 1
+default: deny
+rules:
+  # --- Control plane -------------------------------------------------------
+  - plane: control
+    action: "adapters.*"
+    allow_roles: ["mcp.admin"]
+  - plane: control
+    action: "adapters.read"
+    allow_roles: ["mcp.viewer", "mcp.admin"]
+  - plane: control
+    action: "adapters.list"
+    allow_roles: ["mcp.viewer", "mcp.admin"]
+  - plane: control
+    action: "tools.*"
+    allow_roles: ["mcp.admin"]
+  - plane: control
+    action: "tools.read"
+    allow_roles: ["mcp.viewer", "mcp.admin"]
+  - plane: control
+    action: "tools.list"
+    allow_roles: ["mcp.viewer", "mcp.admin"]
+
+  # --- Data plane (adapter proxy) -----------------------------------------
+  # Any JSON-RPC method is allowed against a `public`-tagged adapter for
+  # both viewers and admins. Admin-tagged adapters admit admins only.
+  - plane: data
+    action: "*"
+    target_tags: ["public"]
+    allow_roles: ["mcp.admin", "mcp.viewer"]
+  - plane: data
+    action: "*"
+    target_tags: ["admin"]
+    allow_roles: ["mcp.admin"]
+
+  # --- Tool router --------------------------------------------------------
+  - plane: data
+    action: "tools/list"
+    allow_roles: ["mcp.admin", "mcp.viewer"]
+  - plane: data
+    action: "tools/call"
+    target_tags: ["public"]
+    allow_roles: ["mcp.admin", "mcp.viewer"]
+  - plane: data
+    action: "tools/call"
+    target_tags: ["admin"]
+    allow_roles: ["mcp.admin"]

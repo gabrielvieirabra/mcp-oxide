@@ -1,0 +1,6 @@
+# Bare echo backend used to exercise the /adapters/{name}/mcp reverse-proxy
+# path. Has no tools; responds to `ping` and echoes every other method.
+name: "mock-echo"
+tools: {}
+fault:
+  record_auth_header: true

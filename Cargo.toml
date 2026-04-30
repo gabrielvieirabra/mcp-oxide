@@ -12,6 +12,7 @@ members = [
     "crates/audit",
     "crates/observability",
     "crates/gateway",
+    "crates/testing",
 ]
 
 [workspace.package]
@@ -92,6 +93,7 @@ mcp-oxide-session = { path = "crates/session", version = "0.1.0" }
 mcp-oxide-secrets = { path = "crates/secrets", version = "0.1.0" }
 mcp-oxide-audit = { path = "crates/audit", version = "0.1.0" }
 mcp-oxide-observability = { path = "crates/observability", version = "0.1.0" }
+mcp-oxide-testing = { path = "crates/testing", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

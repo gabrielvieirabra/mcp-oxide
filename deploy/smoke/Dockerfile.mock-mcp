@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+# Dockerfile for the `mock-mcp` helper binary. Built from the same
+# workspace as the gateway so both containers share dependency caches
+# when built together via docker-compose.
+
+ARG RUST_VERSION=1.88
+
+FROM rust:${RUST_VERSION}-bookworm AS chef
+WORKDIR /src
+RUN cargo install cargo-chef --locked --version 0.1.68
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM rust:${RUST_VERSION}-bookworm AS builder
+WORKDIR /src
+RUN cargo install cargo-chef --locked --version 0.1.68
+COPY --from=chef /src/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --bin mock-mcp --locked
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+LABEL org.opencontainers.image.title="mcp-oxide mock-mcp"
+LABEL org.opencontainers.image.description="Mock MCP server for smoke/integration tests"
+
+USER nonroot:nonroot
+WORKDIR /app
+COPY --from=builder --chown=nonroot:nonroot /src/target/release/mock-mcp /usr/local/bin/mock-mcp
+
+EXPOSE 8090
+ENTRYPOINT ["/usr/local/bin/mock-mcp"]

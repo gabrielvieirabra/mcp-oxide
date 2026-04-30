@@ -1,0 +1,119 @@
+# Smoke-test stack for mcp-oxide.
+#
+#   Gateway
+#     /healthz, /mcp, /adapters/*/mcp, /adapters, /tools, ...
+#
+#   mock-mcp-public   — tagged `public`, has `weather` tool
+#   mock-mcp-admin    — tagged `admin`, has `deploy` tool
+#   mock-echo         — backend for the pre-registered `echo-static` adapter
+#
+# Start:   docker compose -f deploy/smoke/docker-compose.yaml up --build
+# Test:    see tests/smoke/README.md for curl commands
+# Stop:    docker compose -f deploy/smoke/docker-compose.yaml down -v
+
+name: mcp-oxide-smoke
+
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    image: mcp-oxide:smoke
+    ports:
+      - "8080:8080"
+    environment:
+      - MCP_OXIDE_CONFIG=/etc/mcp-oxide/gateway.yaml
+      - RUST_LOG=info,mcp_oxide=debug
+    volumes:
+      - ./gateway.yaml:/etc/mcp-oxide/gateway.yaml:ro
+      - ./policies.yaml:/etc/mcp-oxide/policies.yaml:ro
+      - ./jwt.key:/etc/mcp-oxide/jwt.key:ro
+      - gateway-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      mock-mcp-public:
+        condition: service_healthy
+      mock-mcp-admin:
+        condition: service_healthy
+      mock-echo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mcp-oxide", "--help"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  mock-mcp-public:
+    build:
+      context: ../..
+      dockerfile: deploy/smoke/Dockerfile.mock-mcp
+    image: mcp-oxide-mock:smoke
+    environment:
+      - MOCK_MCP_BIND=0.0.0.0:8090
+      - MOCK_MCP_FIXTURE=/fixtures/public.yaml
+      - RUST_LOG=info
+    volumes:
+      - ./fixtures:/fixtures:ro
+    ports:
+      - "18090:8090"  # exposed on host for direct curl if desired
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - "no-new-privileges:true"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mock-mcp", "--help"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  mock-mcp-admin:
+    image: mcp-oxide-mock:smoke
+    environment:
+      - MOCK_MCP_BIND=0.0.0.0:8090
+      - MOCK_MCP_FIXTURE=/fixtures/admin.yaml
+      - RUST_LOG=info
+    volumes:
+      - ./fixtures:/fixtures:ro
+    ports:
+      - "18091:8090"
+    depends_on:
+      - mock-mcp-public
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - "no-new-privileges:true"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mock-mcp", "--help"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  mock-echo:
+    image: mcp-oxide-mock:smoke
+    environment:
+      - MOCK_MCP_BIND=0.0.0.0:8090
+      - MOCK_MCP_FIXTURE=/fixtures/echo.yaml
+      - RUST_LOG=info
+    volumes:
+      - ./fixtures:/fixtures:ro
+    ports:
+      - "18092:8090"
+    depends_on:
+      - mock-mcp-public
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - "no-new-privileges:true"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mock-mcp", "--help"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+volumes:
+  gateway-data:
