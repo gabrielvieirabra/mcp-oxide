@@ -624,3 +624,327 @@ rules:
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "data plane should route to runtime adapter");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 hardening regressions
+// ---------------------------------------------------------------------------
+
+/// S4: names must be DNS-label-safe — path-traversal and shell metachars
+/// are rejected with 400 instead of reaching the deployment provider.
+#[tokio::test]
+async fn create_adapter_rejects_path_traversal_name() {
+    let state = build_state();
+    let app = router(state);
+    let token = make_token("admin", &["mcp.admin"]);
+
+    for bad_name in [
+        "../etc/passwd",
+        "foo; rm -rf /",
+        "Foo",           // uppercase
+        "foo/bar",       // slash
+        "foo bar",       // whitespace
+        "-leading-dash",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/adapters")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": bad_name,
+                            "image": "registry.example.com/test:1.0",
+                            "upstream": "http://not-used",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "should reject name {bad_name:?}"
+        );
+    }
+}
+
+/// S3: env var names in reserved prefixes (LD_, AWS_, DOCKER_, …) are
+/// refused so a tenant can't hijack the gateway's host process or leak
+/// cloud credentials into the workload.
+#[tokio::test]
+async fn create_adapter_rejects_reserved_env_prefix() {
+    let state = build_state();
+    let app = router(state);
+    let token = make_token("admin", &["mcp.admin"]);
+
+    for bad_env in ["LD_PRELOAD", "AWS_ACCESS_KEY_ID", "DOCKER_HOST", "PATH"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/adapters")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "evil-adapter",
+                            "image": "registry.example.com/test:1.0",
+                            "upstream": "http://not-used",
+                            "env": [{ "name": bad_env, "value": "x" }],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "should reject env {bad_env}"
+        );
+    }
+}
+
+/// S1 / L5: tools/call must deny when policy forbids and must still produce
+/// an audit trail. We use a policy that allows tools.create (so we can set
+/// the tool up) but denies tools/call.
+#[tokio::test]
+async fn tool_router_enforces_authz_on_call() {
+    let identity: Arc<dyn IdProvider> = Arc::new(StaticJwtProvider::new(StaticJwtConfig {
+        algorithm: Algorithm::HS256,
+        key: DecodingKey::from_secret(HS_SECRET),
+        issuer: Some(ISSUER.into()),
+        audiences: vec![AUD.into()],
+        clock_skew_s: 5,
+        extractor: ClaimExtractor::default(),
+    }));
+
+    // Admin can set up tools, but the data-plane rule for tools/call only
+    // allows role `mcp.admin`. We'll create the tool, then call it as a
+    // viewer and expect a JSON-RPC forbidden error.
+    let authz: Arc<dyn PolicyEngine> = Arc::new(
+        YamlRbacEngine::from_str(
+            r#"
+version: 1
+default: deny
+rules:
+  - plane: control
+    action: "tools.*"
+    allow_roles: ["mcp.admin"]
+  - plane: data
+    action: "tools/call"
+    allow_roles: ["mcp.admin"]
+  - plane: data
+    action: "tools/list"
+    allow_roles: ["mcp.admin", "mcp.viewer"]
+"#,
+            "test",
+        )
+        .unwrap(),
+    );
+
+    let state = AppState::builder().identity(identity).authz(authz).build().unwrap();
+    let app = router(state);
+    let admin = make_token("admin", &["mcp.admin"]);
+    let viewer = make_token("viewer", &["mcp.viewer"]);
+
+    // Create a tool as admin (upstream doesn't matter — we won't reach it).
+    let create = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/tools")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {admin}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&json!({
+                        "name": "priv-tool",
+                        "image": "registry.example.com/tool:1.0",
+                        "tool_definition": {
+                            "name": "priv-tool",
+                            "input_schema": { "type": "object" }
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    // Viewer attempts tools/call → must be denied BEFORE any upstream hop.
+    let call = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {viewer}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": { "name": "priv-tool", "arguments": {} }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // JSON-RPC responses carry error codes in the body, not HTTP status.
+    assert_eq!(call.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(call.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["error"].is_object(), "response must be a JSON-RPC error");
+    let code = v["error"]["code"].as_i64().unwrap();
+    assert_eq!(code, -32002, "expected forbidden code (-32002), got {code}");
+}
+
+/// B3: tools/list filters out tools the caller cannot call, preventing
+/// information disclosure of admin-only tool names to viewers.
+#[tokio::test]
+async fn tools_list_hides_inaccessible_tools() {
+    let identity: Arc<dyn IdProvider> = Arc::new(StaticJwtProvider::new(StaticJwtConfig {
+        algorithm: Algorithm::HS256,
+        key: DecodingKey::from_secret(HS_SECRET),
+        issuer: Some(ISSUER.into()),
+        audiences: vec![AUD.into()],
+        clock_skew_s: 5,
+        extractor: ClaimExtractor::default(),
+    }));
+
+    // Viewers can list and call `public`-tagged tools only. Admin can do
+    // anything. We'll register one public tool and one admin-only tool,
+    // then check that the viewer's tools/list returns only the public one.
+    let authz: Arc<dyn PolicyEngine> = Arc::new(
+        YamlRbacEngine::from_str(
+            r#"
+version: 1
+default: deny
+rules:
+  - plane: control
+    action: "tools.*"
+    allow_roles: ["mcp.admin"]
+  - plane: data
+    action: "tools/list"
+    allow_roles: ["mcp.admin", "mcp.viewer"]
+  - plane: data
+    action: "tools/call"
+    target_tags: ["public"]
+    allow_roles: ["mcp.admin", "mcp.viewer"]
+  - plane: data
+    action: "tools/call"
+    target_tags: ["admin"]
+    allow_roles: ["mcp.admin"]
+"#,
+            "test",
+        )
+        .unwrap(),
+    );
+
+    let state = AppState::builder().identity(identity).authz(authz).build().unwrap();
+    let app = router(state);
+    let admin = make_token("admin", &["mcp.admin"]);
+    let viewer = make_token("viewer", &["mcp.viewer"]);
+
+    for (name, tag) in [("pub-tool", "public"), ("sec-tool", "admin")] {
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/tools")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {admin}"))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": name,
+                            "image": "registry.example.com/tool:1.0",
+                            "tags": [tag],
+                            "tool_definition": {
+                                "name": name,
+                                "input_schema": { "type": "object" }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+    }
+
+    let list = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {viewer}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(list.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let tools = v["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"pub-tool"), "public tool must be visible");
+    assert!(
+        !names.contains(&"sec-tool"),
+        "admin-only tool must NOT leak to viewer, got {names:?}"
+    );
+}
+
+/// Q1 regression: names that pass resource-name validation also produce
+/// a valid Location header, so no panic can escape even on pathological
+/// (but unicode-valid) input.
+#[tokio::test]
+async fn create_adapter_valid_name_sets_location_header() {
+    let state = build_state();
+    let app = router(state);
+    let token = make_token("admin", &["mcp.admin"]);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/adapters")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&json!({
+                        "name": "a-valid-123",
+                        "image": "registry.example.com/test:1.0",
+                        "upstream": "http://upstream:9000/mcp",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert_eq!(loc, "/adapters/a-valid-123");
+}
+

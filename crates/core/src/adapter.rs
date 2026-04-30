@@ -64,20 +64,20 @@ fn default_path() -> String {
     "/mcp".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvVar {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretRef {
     pub name: String,
     pub provider: String,
     pub key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Resources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,

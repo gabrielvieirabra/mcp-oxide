@@ -166,3 +166,27 @@ pub fn etag_for(revision: u64) -> HeaderValue {
     // Weak ETag because payload may have insignificant ordering differences.
     HeaderValue::from_str(&format!("W/\"{revision}\"")).expect("valid etag")
 }
+
+/// Build a `Location` header value for a created resource, returning an error
+/// if `name` produced an invalid header value. `name` should already be
+/// validated by the caller (see `validation::validate_resource_name`).
+pub fn location_for(kind: CpKind, name: &str) -> Result<HeaderValue, AppError> {
+    let path = format!("/{}s/{name}", kind.as_str());
+    HeaderValue::try_from(path).map_err(|_| {
+        AppError::Core(mcp_oxide_core::Error::InvalidRequest(
+            "name contains characters invalid in Location header".into(),
+        ))
+    })
+}
+
+/// Construct a `DeploymentHandle` for an existing adapter/tool by name.
+/// Future iterations may persist the handle in the `MetadataStore`; today we
+/// reconstruct it deterministically from the name.
+#[must_use]
+pub fn handle_for(name: &str) -> mcp_oxide_core::providers::DeploymentHandle {
+    mcp_oxide_core::providers::DeploymentHandle {
+        id: name.to_string(),
+        namespace: None,
+        endpoint_url: None,
+    }
+}

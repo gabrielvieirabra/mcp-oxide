@@ -180,6 +180,16 @@ pub enum DeploymentConfig {
         socket: String,
         #[serde(default = "default_docker_network")]
         network: String,
+        #[serde(default = "default_docker_connect_timeout_s")]
+        connect_timeout_s: u64,
+        /// If non-empty, the docker provider will refuse to deploy an image
+        /// whose registry is not listed here. `docker.io` is implicit for
+        /// short references like `alpine`.
+        #[serde(default)]
+        allowed_registries: Vec<String>,
+        /// Reject image references that aren't pinned to a digest.
+        #[serde(default)]
+        require_digest_pinning: bool,
     },
 }
 
@@ -189,6 +199,10 @@ fn default_docker_socket() -> String {
 
 fn default_docker_network() -> String {
     "mcp-oxide".into()
+}
+
+fn default_docker_connect_timeout_s() -> u64 {
+    120
 }
 
 // -------- Upstream ---------------------------------------------------------

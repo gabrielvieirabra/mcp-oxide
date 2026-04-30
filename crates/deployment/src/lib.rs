@@ -5,6 +5,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod image_ref;
+
 mod noop;
 pub use noop::NoopExternalProvider;
 

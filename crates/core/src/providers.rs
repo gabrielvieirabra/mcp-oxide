@@ -63,8 +63,15 @@ pub enum DeploymentKind {
 
 #[derive(Debug, Clone)]
 pub struct DeploymentHandle {
+    /// Provider-specific resource id (e.g. container name, k8s resource name).
     pub id: String,
+    /// Provider-specific scope (docker network, k8s namespace, ...).
     pub namespace: Option<String>,
+    /// Endpoint the gateway should route to for this deployment. Populated
+    /// by the provider on `apply` using the adapter/tool spec's
+    /// `endpoint.port` and `endpoint.path`. `None` is only valid for
+    /// `noop-external` deployments whose URL is stored elsewhere.
+    pub endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]

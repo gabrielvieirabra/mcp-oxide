@@ -10,7 +10,7 @@ use chrono::Utc;
 use mcp_oxide_core::{
     adapter::{Adapter, Endpoint, EnvVar, HealthProbe, ImageRef, Resources, SecretRef, SessionAffinity},
     audit::AuditDecision,
-    providers::Filter,
+    providers::{DeploymentKind, DeploymentSpec, Filter},
     tool::{Tool, ToolDefinition},
 };
 use serde::{Deserialize, Serialize};
@@ -19,8 +19,12 @@ use std::collections::BTreeMap;
 use crate::{
     auth::AuthUser,
     error::AppError,
-    routes::control_plane_helpers::{
-        authorize, emit_audit, etag_for, extract_trace_id, parse_if_match, CpKind, CpVerb, ETAG,
+    routes::{
+        control_plane_helpers::{
+            authorize, emit_audit, etag_for, extract_trace_id, handle_for, location_for,
+            parse_if_match, CpKind, CpVerb, ETAG,
+        },
+        validation::{validate_env_var_name, validate_resource_name},
     },
     state::AppState,
 };
@@ -358,6 +362,29 @@ pub async fn create_adapter(
         }
     };
 
+    // S4: validate the name up front so it's safe as a container name,
+    // Location header, and URL path segment. Also validate all env var
+    // names so callers can't inject LD_PRELOAD etc. (see S3).
+    if let Err(e) = validate_resource_name(&body.name) {
+        let err = AppError::Core(e);
+        emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+        return Err(err);
+    }
+    for env in &body.env {
+        if let Err(e) = validate_env_var_name(&env.name) {
+            let err = AppError::Core(e);
+            emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+            return Err(err);
+        }
+    }
+    let location = match location_for(CpKind::Adapter, &body.name) {
+        Ok(l) => l,
+        Err(e) => {
+            emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&e.to_string())).await;
+            return Err(e);
+        }
+    };
+
     let existing = state.metadata.get_adapter(&body.name).await?;
     if existing.is_some() {
         let err = AppError::Core(mcp_oxide_core::Error::Conflict(format!("adapter '{}' already exists", body.name)));
@@ -389,30 +416,37 @@ pub async fn create_adapter(
         updated_at: Some(now),
     };
 
-    // Deploy via DeploymentProvider if no explicit upstream URL.
-    let _handle = if body.upstream.is_none() {
-        let spec = mcp_oxide_core::providers::DeploymentSpec {
+    // S8: metadata is the source of truth. Persist FIRST so a subsequent
+    // deploy failure leaves a recoverable record (user can re-POST or DELETE).
+    // If we deployed first and metadata failed, we'd leak an untracked
+    // container. If deploy fails after metadata write, we delete the record
+    // on the way out.
+    state.metadata.put_adapter(&adapter).await?;
+
+    if body.upstream.is_none() {
+        let spec = DeploymentSpec {
             name: body.name.clone(),
-            kind: mcp_oxide_core::providers::DeploymentKind::Adapter,
+            kind: DeploymentKind::Adapter,
             adapter: Some(adapter.clone()),
             tool: None,
         };
-        state.deployment.apply(&spec).await?
-    } else {
-        mcp_oxide_core::providers::DeploymentHandle {
-            id: body.name.clone(),
-            namespace: None,
+        if let Err(e) = state.deployment.apply(&spec).await {
+            // Roll back metadata so we don't expose an adapter that can
+            // never be routed to.
+            let _ = state.metadata.delete_adapter(&body.name).await;
+            let err = AppError::Core(e);
+            emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+            return Err(err);
         }
-    };
+    }
 
-    state.metadata.put_adapter(&adapter).await?;
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Allow, policy_id, None).await;
 
     let resp = AdapterResponse::from(&adapter);
     Ok((
         StatusCode::CREATED,
         [
-            (header::LOCATION, format!("/adapters/{}", body.name).parse().unwrap()),
+            (header::LOCATION, location),
             (ETAG, etag_for(1)),
         ],
         Json(resp),
@@ -460,6 +494,17 @@ pub async fn update_adapter(
         }
     };
 
+    // Validate any newly supplied env var names (S3).
+    if let Some(env) = &body.env {
+        for e in env {
+            if let Err(err) = validate_env_var_name(&e.name) {
+                let err = AppError::Core(err);
+                emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Update, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+                return Err(err);
+            }
+        }
+    }
+
     // If-Match header takes precedence over body.revision.
     let header_rev = parse_if_match(&headers)?;
 
@@ -477,6 +522,17 @@ pub async fn update_adapter(
 
     let now = Utc::now();
     let prev_created = adapter.created_at;
+    // Capture the pre-update snapshot so we can tell whether the deployment
+    // needs to be re-applied (B6). Only fields that influence the running
+    // container are tracked here.
+    let prev_image = adapter.image.reference.clone();
+    let prev_port = adapter.endpoint.port;
+    let prev_path = adapter.endpoint.path.clone();
+    let prev_env = adapter.env.clone();
+    let prev_secret_refs = adapter.secret_refs.clone();
+    let prev_replicas = adapter.replicas;
+    let prev_resources = adapter.resources.clone();
+    let prev_upstream = adapter.upstream.clone();
 
     if let Some(d) = body.description { adapter.description = Some(d); }
     if let Some(img) = body.image { adapter.image = ImageRef { reference: img }; }
@@ -493,12 +549,40 @@ pub async fn update_adapter(
     if let Some(s) = body.session_affinity { adapter.session_affinity = match s.as_str() { "none" => SessionAffinity::None, _ => SessionAffinity::Sticky }; }
     if let Some(l) = body.labels { adapter.labels = l; }
 
+    let deployment_changed = prev_image != adapter.image.reference
+        || prev_port != adapter.endpoint.port
+        || prev_path != adapter.endpoint.path
+        || prev_env != adapter.env
+        || prev_secret_refs != adapter.secret_refs
+        || prev_replicas != adapter.replicas
+        || prev_resources.cpu != adapter.resources.cpu
+        || prev_resources.memory != adapter.resources.memory
+        || prev_upstream != adapter.upstream;
+
     let new_rev = adapter.revision.unwrap_or(0) + 1;
     adapter.revision = Some(new_rev);
     adapter.updated_at = Some(now);
     adapter.created_at = prev_created;
 
     state.metadata.put_adapter(&adapter).await?;
+
+    // B6: re-apply the deployment if any field that affects the running
+    // container changed. If the adapter uses an explicit external upstream
+    // we don't manage its runtime.
+    if deployment_changed && adapter.upstream.is_none() {
+        let spec = DeploymentSpec {
+            name: adapter.name.clone(),
+            kind: DeploymentKind::Adapter,
+            adapter: Some(adapter.clone()),
+            tool: None,
+        };
+        if let Err(e) = state.deployment.apply(&spec).await {
+            let err = AppError::Core(e);
+            emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Update, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+            return Err(err);
+        }
+    }
+
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Update, &name, AuditDecision::Allow, policy_id, None).await;
     Ok((
         StatusCode::OK,
@@ -537,13 +621,24 @@ pub async fn delete_adapter(
         }
     }
 
-    // Delete from deployment provider if no explicit upstream.
+    // B5: if the adapter is provider-managed, we must successfully tear it
+    // down before removing it from the metadata store. If the delete fails
+    // (other than NotFound), the metadata record is kept so the caller can
+    // retry. A NotFound from the provider is treated as success — the
+    // container was already gone.
     if existing.upstream.is_none() {
-        let handle = mcp_oxide_core::providers::DeploymentHandle {
-            id: name.clone(),
-            namespace: None,
-        };
-        let _ = state.deployment.delete(&handle).await;
+        let handle = handle_for(&name);
+        match state.deployment.delete(&handle).await {
+            Ok(()) => {}
+            Err(mcp_oxide_core::Error::NotFound(_)) => {
+                tracing::debug!(adapter = %name, "deployment already absent");
+            }
+            Err(e) => {
+                let err = AppError::Core(e);
+                emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Delete, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+                return Err(err);
+            }
+        }
     }
 
     state.metadata.delete_adapter(&name).await?;
@@ -587,6 +682,26 @@ pub async fn create_tool(
         }
     };
 
+    if let Err(e) = validate_resource_name(&body.name) {
+        let err = AppError::Core(e);
+        emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+        return Err(err);
+    }
+    for env in &body.env {
+        if let Err(e) = validate_env_var_name(&env.name) {
+            let err = AppError::Core(e);
+            emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+            return Err(err);
+        }
+    }
+    let location = match location_for(CpKind::Tool, &body.name) {
+        Ok(l) => l,
+        Err(e) => {
+            emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&e.to_string())).await;
+            return Err(e);
+        }
+    };
+
     let existing = state.metadata.get_tool(&body.name).await?;
     if existing.is_some() {
         let err = AppError::Core(mcp_oxide_core::Error::Conflict(format!("tool '{}' already exists", body.name)));
@@ -617,23 +732,29 @@ pub async fn create_tool(
         updated_at: Some(now),
     };
 
-    // Deploy via DeploymentProvider.
-    let spec = mcp_oxide_core::providers::DeploymentSpec {
+    // S8: persist first, deploy second; roll back metadata on deploy failure.
+    state.metadata.put_tool(&tool).await?;
+
+    let spec = DeploymentSpec {
         name: body.name.clone(),
-        kind: mcp_oxide_core::providers::DeploymentKind::Tool,
+        kind: DeploymentKind::Tool,
         adapter: None,
         tool: Some(tool.clone()),
     };
-    let _handle = state.deployment.apply(&spec).await?;
+    if let Err(e) = state.deployment.apply(&spec).await {
+        let _ = state.metadata.delete_tool(&body.name).await;
+        let err = AppError::Core(e);
+        emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+        return Err(err);
+    }
 
-    state.metadata.put_tool(&tool).await?;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Allow, policy_id, None).await;
 
     let resp = ToolResponse::from(&tool);
     Ok((
         StatusCode::CREATED,
         [
-            (header::LOCATION, format!("/tools/{}", body.name).parse().unwrap()),
+            (header::LOCATION, location),
             (ETAG, etag_for(1)),
         ],
         Json(resp),
@@ -681,6 +802,16 @@ pub async fn update_tool(
         }
     };
 
+    if let Some(env) = &body.env {
+        for e in env {
+            if let Err(err) = validate_env_var_name(&e.name) {
+                let err = AppError::Core(err);
+                emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Update, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+                return Err(err);
+            }
+        }
+    }
+
     let header_rev = parse_if_match(&headers)?;
 
     let mut tool = state.metadata.get_tool(&name).await?
@@ -697,6 +828,12 @@ pub async fn update_tool(
 
     let now = Utc::now();
     let prev_created = tool.created_at;
+    let prev_image = tool.image.reference.clone();
+    let prev_port = tool.endpoint.port;
+    let prev_path = tool.endpoint.path.clone();
+    let prev_env = tool.env.clone();
+    let prev_secret_refs = tool.secret_refs.clone();
+    let prev_resources = tool.resources.clone();
 
     if let Some(d) = body.description { tool.description = Some(d); }
     if let Some(img) = body.image { tool.image = ImageRef { reference: img }; }
@@ -717,12 +854,34 @@ pub async fn update_tool(
     if let Some(t) = body.tags { tool.tags = t; }
     if let Some(r) = body.resources { tool.resources = Resources { cpu: r.cpu, memory: r.memory }; }
 
+    let deployment_changed = prev_image != tool.image.reference
+        || prev_port != tool.endpoint.port
+        || prev_path != tool.endpoint.path
+        || prev_env != tool.env
+        || prev_secret_refs != tool.secret_refs
+        || prev_resources != tool.resources;
+
     let new_rev = tool.revision.unwrap_or(0) + 1;
     tool.revision = Some(new_rev);
     tool.updated_at = Some(now);
     tool.created_at = prev_created;
 
     state.metadata.put_tool(&tool).await?;
+
+    if deployment_changed {
+        let spec = DeploymentSpec {
+            name: tool.name.clone(),
+            kind: DeploymentKind::Tool,
+            adapter: None,
+            tool: Some(tool.clone()),
+        };
+        if let Err(e) = state.deployment.apply(&spec).await {
+            let err = AppError::Core(e);
+            emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Update, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+            return Err(err);
+        }
+    }
+
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Update, &name, AuditDecision::Allow, policy_id, None).await;
     Ok((
         StatusCode::OK,
@@ -761,12 +920,20 @@ pub async fn delete_tool(
         }
     }
 
-    // Delete from deployment provider.
-    let handle = mcp_oxide_core::providers::DeploymentHandle {
-        id: name.clone(),
-        namespace: None,
-    };
-    let _ = state.deployment.delete(&handle).await;
+    // B5: tear down the deployment before removing metadata. A missing
+    // container is treated as success.
+    let handle = handle_for(&name);
+    match state.deployment.delete(&handle).await {
+        Ok(()) => {}
+        Err(mcp_oxide_core::Error::NotFound(_)) => {
+            tracing::debug!(tool = %name, "deployment already absent");
+        }
+        Err(e) => {
+            let err = AppError::Core(e);
+            emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Delete, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+            return Err(err);
+        }
+    }
 
     state.metadata.delete_tool(&name).await?;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Delete, &name, AuditDecision::Allow, policy_id, None).await;
@@ -800,15 +967,11 @@ pub async fn get_adapter_status(
         }
     };
 
-    let _adapter = state.metadata.get_adapter(&name).await?
+    // 404 if the caller asks about an adapter that doesn't exist.
+    let _ = state.metadata.get_adapter(&name).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("adapter '{name}'")))?;
 
-    let handle = mcp_oxide_core::providers::DeploymentHandle {
-        id: name.clone(),
-        namespace: None,
-    };
-    let _ = state.deployment.status(&handle).await;
-
+    let handle = handle_for(&name);
     let status = state.deployment.status(&handle).await?;
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Read, &name, AuditDecision::Allow, policy_id, None).await;
 
@@ -835,15 +998,10 @@ pub async fn get_tool_status(
         }
     };
 
-    let _tool = state.metadata.get_tool(&name).await?
+    let _ = state.metadata.get_tool(&name).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("tool '{name}'")))?;
 
-    let handle = mcp_oxide_core::providers::DeploymentHandle {
-        id: name.clone(),
-        namespace: None,
-    };
-    let _ = state.deployment.status(&handle).await;
-
+    let handle = handle_for(&name);
     let status = state.deployment.status(&handle).await?;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Read, &name, AuditDecision::Allow, policy_id, None).await;
 

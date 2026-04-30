@@ -142,24 +142,63 @@ impl AppState {
     /// Resolve an adapter by name. Static config takes precedence; falls back
     /// to the `MetadataStore` so runtime-registered adapters are routable
     /// without a restart.
+    ///
+    /// For runtime adapters without an explicit `upstream`, the
+    /// `DeploymentProvider` is queried for a ready endpoint. Resolution fails
+    /// closed (`Ok(None)`) rather than routing to a stale or guessed URL.
     pub async fn resolve_adapter(&self, name: &str) -> anyhow::Result<Option<ResolvedAdapter>> {
         if let Some(a) = self.adapters.get(name) {
             return Ok(Some(a.clone()));
         }
         if let Some(a) = self.metadata.get_adapter(name).await? {
-            let Some(upstream) = a.upstream.clone() else {
-                // Without DeploymentProvider (Phase 3) and no explicit
-                // upstream URL, there is nowhere to route to.
-                return Ok(None);
+            if let Some(upstream) = a.upstream.clone() {
+                return Ok(Some(ResolvedAdapter {
+                    name: a.name,
+                    upstream,
+                    required_roles: a.required_roles,
+                    tags: a.tags,
+                }));
+            }
+            // Adapter managed by the DeploymentProvider — ask it for an
+            // endpoint. The provider is authoritative on port/DNS details.
+            let handle = mcp_oxide_core::providers::DeploymentHandle {
+                id: a.name.clone(),
+                namespace: None,
+                endpoint_url: None,
             };
-            return Ok(Some(ResolvedAdapter {
-                name: a.name,
-                upstream,
-                required_roles: a.required_roles,
-                tags: a.tags,
-            }));
+            if let Ok(endpoints) = self.deployment.endpoints(&handle).await {
+                if let Some(ep) = endpoints.into_iter().next() {
+                    return Ok(Some(ResolvedAdapter {
+                        name: a.name,
+                        upstream: ep.url,
+                        required_roles: a.required_roles,
+                        tags: a.tags,
+                    }));
+                }
+            }
         }
         Ok(None)
+    }
+
+    /// Resolve a tool's current routable endpoint. Returns `None` when the
+    /// tool is not registered or has no ready deployment.
+    pub async fn resolve_tool_endpoint(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<(mcp_oxide_core::tool::Tool, String)>> {
+        let Some(tool) = self.metadata.get_tool(name).await? else {
+            return Ok(None);
+        };
+        let handle = mcp_oxide_core::providers::DeploymentHandle {
+            id: tool.name.clone(),
+            namespace: None,
+            endpoint_url: None,
+        };
+        let endpoints = self.deployment.endpoints(&handle).await?;
+        let Some(ep) = endpoints.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some((tool, ep.url)))
     }
 }
 
@@ -322,14 +361,24 @@ async fn build_metadata(cfg: &Config) -> anyhow::Result<Arc<dyn MetadataStore>> 
     })
 }
 
+#[allow(clippy::unused_async)] // async only when the docker feature is on
 async fn build_deployment(cfg: &Config) -> anyhow::Result<Arc<dyn DeploymentProvider>> {
     Ok(match &cfg.providers.deployment {
         DeploymentConfig::NoopExternal => Arc::new(NoopExternalProvider),
         #[cfg(feature = "docker")]
-        DeploymentConfig::Docker { socket, network } => {
+        DeploymentConfig::Docker {
+            socket,
+            network,
+            connect_timeout_s,
+            allowed_registries,
+            require_digest_pinning,
+        } => {
             let config = mcp_oxide_deployment::DockerConfig {
                 socket: socket.clone(),
                 network: network.clone(),
+                connect_timeout_s: *connect_timeout_s,
+                allowed_registries: allowed_registries.clone(),
+                require_digest_pinning: *require_digest_pinning,
             };
             Arc::new(DockerProvider::new(config).await?)
         }
