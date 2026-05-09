@@ -32,8 +32,15 @@ pub async fn invoke(
         .and_then(|v| v.to_str().ok())
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned);
 
-    // Resolve adapter from static config or MetadataStore.
-    let adapter = match state.resolve_adapter(&name).await {
+    // Resolve adapter from static config or MetadataStore. Static adapters
+    // are tenant-less; runtime adapters are scoped to the caller's tenant.
+    // The session id (if any) is threaded through so multi-replica
+    // deployments stay sticky for a given client.
+    let session_id = crate::routes::data_plane_helpers::extract_session_id(&headers);
+    let adapter = match state
+        .resolve_adapter_with_session(&name, user.tenant.as_deref(), session_id.as_ref())
+        .await
+    {
         Ok(Some(a)) => a,
         Ok(None) => {
             emit_audit(
@@ -80,6 +87,7 @@ pub async fn invoke(
         resource: Resource {
             kind: ResourceKind::Adapter,
             name: &adapter.name,
+            tenant: user.tenant.as_deref(),
             tags: adapter.tags.clone(),
             required_roles: adapter.required_roles.clone(),
         },

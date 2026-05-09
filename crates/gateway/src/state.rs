@@ -6,12 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jsonwebtoken::Algorithm;
+use moka::future::Cache;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use mcp_oxide_audit::StdoutAuditSink;
 use mcp_oxide_authz::{DenyAllPolicyEngine, YamlRbacEngine};
 use mcp_oxide_core::providers::{
-    AuditSink, DeploymentProvider, IdProvider, MetadataStore, PolicyEngine, SecretProvider,
-    SessionStore,
+    AuditSink, DeploymentProvider, Endpoint as ProviderEndpoint, IdProvider, MetadataStore,
+    PolicyEngine, SecretProvider, SessionStore,
 };
+use mcp_oxide_core::session::{BackendId, SessionId};
 use mcp_oxide_deployment::NoopExternalProvider;
 #[cfg(feature = "docker")]
 use mcp_oxide_deployment::DockerProvider;
@@ -45,6 +48,39 @@ impl From<StaticAdapter> for ResolvedAdapter {
     }
 }
 
+/// Cache key for tenant-scoped adapter/tool resolution.
+type ResolveKey = (Option<String>, String);
+
+/// TTL for the resolution caches. Short enough that an operator's
+/// `MetadataStore` change made out-of-band (e.g. via raw SQL) propagates
+/// within seconds; long enough to absorb the bulk of repeated lookups
+/// from a busy data plane.
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(5);
+const RESOLVE_CACHE_CAP: u64 = 10_000;
+
+/// TTL applied when the data plane binds a session to a backend after
+/// picking a fresh endpoint. Long enough that a typical MCP session stays
+/// pinned through its lifetime; short enough that abandoned sessions don't
+/// hold backend slots forever.
+const SESSION_BIND_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Cached resolution of a runtime-registered adapter: the `ResolvedAdapter`
+/// metadata plus the current set of provider endpoints. Picking happens on
+/// every request from the cached endpoint list, so multi-replica deployments
+/// can round-robin or honor session affinity without re-hitting the
+/// `DeploymentProvider`.
+#[derive(Debug, Clone)]
+pub struct ResolvedAdapterRecord {
+    pub meta: ResolvedAdapter,
+    pub endpoints: Arc<[ProviderEndpoint]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedToolRecord {
+    pub tool: mcp_oxide_core::tool::Tool,
+    pub endpoints: Arc<[ProviderEndpoint]>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub identity: Arc<dyn IdProvider>,
@@ -57,6 +93,21 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub adapters: Arc<HashMap<String, ResolvedAdapter>>,
     pub started_at: std::time::Instant,
+    /// Tenant-scoped cache for runtime-registered adapters. Static adapters
+    /// from config bypass this and are served from `adapters` directly.
+    adapter_cache: Cache<ResolveKey, Arc<ResolvedAdapterRecord>>,
+    /// Tenant-scoped cache for tool resolution.
+    tool_cache: Cache<ResolveKey, Arc<ResolvedToolRecord>>,
+    /// Per-target round-robin counter, used when no session id pins the
+    /// caller to a specific backend.
+    rr_counters: Arc<parking_lot::RwLock<HashMap<String, AtomicUsize>>>,
+}
+
+fn build_resolve_cache<V: Clone + Send + Sync + 'static>() -> Cache<ResolveKey, V> {
+    Cache::builder()
+        .max_capacity(RESOLVE_CACHE_CAP)
+        .time_to_live(RESOLVE_CACHE_TTL)
+        .build()
 }
 
 impl std::fmt::Debug for AppState {
@@ -93,17 +144,26 @@ impl AppState {
             adapter_map.insert(a.name.clone(), ResolvedAdapter::from(a.clone()));
         }
 
+        // Start a background sweeper so expired session bindings are
+        // reclaimed even when the affected session is never touched again
+        // (e.g. clients that vanish without calling drop_session).
+        let session = Arc::new(InMemorySessionStore::new());
+        session.start_sweeper();
+
         let s = Self {
             identity,
             authz,
             deployment,
             metadata,
-            session: Arc::new(InMemorySessionStore::new()),
+            session,
             secrets: Arc::new(EnvSecretProvider),
             audit: Arc::new(StdoutAuditSink),
             http,
             adapters: Arc::new(adapter_map),
             started_at: std::time::Instant::now(),
+            adapter_cache: build_resolve_cache(),
+            tool_cache: build_resolve_cache(),
+            rr_counters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         };
         tracing::info!(
             identity = s.identity.kind(),
@@ -116,6 +176,20 @@ impl AppState {
             static_adapters = s.adapters.len(),
             "providers wired"
         );
+
+        // Spawn the reconciler. Single-replica gateways always lead; the
+        // K8s-leased implementation lands in Phase 3.5c. Tests use
+        // `AppState::builder()` which does NOT start a reconciler so
+        // existing assertions stay deterministic.
+        let leader: Arc<dyn mcp_oxide_core::providers::LeaderLock> =
+            Arc::new(crate::reconciler::InProcessLeader);
+        let reconciler = crate::reconciler::Reconciler::new(
+            s.clone(),
+            leader,
+            crate::reconciler::ReconcilerConfig::default(),
+        );
+        let _ = reconciler.spawn();
+
         Ok(s)
     }
 
@@ -139,54 +213,137 @@ impl AppState {
         })
     }
 
-    /// Resolve an adapter by name. Static config takes precedence; falls back
-    /// to the `MetadataStore` so runtime-registered adapters are routable
-    /// without a restart.
+    /// Resolve an adapter by name within the caller's tenant. Static config
+    /// adapters are tenant-less and visible to every authenticated caller;
+    /// runtime-registered adapters are scoped strictly to the tenant that
+    /// created them.
     ///
-    /// For runtime adapters without an explicit `upstream`, the
-    /// `DeploymentProvider` is queried for a ready endpoint. Resolution fails
-    /// closed (`Ok(None)`) rather than routing to a stale or guessed URL.
-    pub async fn resolve_adapter(&self, name: &str) -> anyhow::Result<Option<ResolvedAdapter>> {
+    /// Runtime resolutions are served from a short-TTL cache so the data
+    /// plane doesn't hit `MetadataStore` + `DeploymentProvider` on every
+    /// request. The control plane invalidates entries on mutation, so the
+    /// TTL only bounds drift from out-of-band `MetadataStore` writes (e.g.
+    /// raw SQL).
+    pub async fn resolve_adapter(
+        &self,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> anyhow::Result<Option<ResolvedAdapter>> {
+        self.resolve_adapter_with_session(name, tenant, None).await
+    }
+
+    /// Tenant-scoped adapter resolution that honors session affinity. If
+    /// `session_id` is `Some` and a binding exists in the `SessionStore`,
+    /// the matching backend is preferred over the round-robin pick.
+    pub async fn resolve_adapter_with_session(
+        &self,
+        name: &str,
+        tenant: Option<&str>,
+        session_id: Option<&SessionId>,
+    ) -> anyhow::Result<Option<ResolvedAdapter>> {
         if let Some(a) = self.adapters.get(name) {
             return Ok(Some(a.clone()));
         }
-        if let Some(a) = self.metadata.get_adapter(name).await? {
-            if let Some(upstream) = a.upstream.clone() {
-                return Ok(Some(ResolvedAdapter {
-                    name: a.name,
-                    upstream,
-                    required_roles: a.required_roles,
-                    tags: a.tags,
-                }));
-            }
-            // Adapter managed by the DeploymentProvider — ask it for an
-            // endpoint. The provider is authoritative on port/DNS details.
+        let record = self.adapter_record(name, tenant).await?;
+        let Some(record) = record else { return Ok(None) };
+
+        // Adapters with an explicit upstream (noop-external) only ever have
+        // the synthetic single endpoint we minted at cache fill — pick is
+        // a no-op. For provider-managed adapters with multiple endpoints
+        // the picker chooses based on session affinity / round-robin.
+        let chosen = self
+            .pick_endpoint(&record.meta.name, &record.endpoints, session_id)
+            .await;
+        let Some(chosen) = chosen else {
+            return Ok(None);
+        };
+        let mut out = record.meta.clone();
+        out.upstream = chosen.url;
+        Ok(Some(out))
+    }
+
+    async fn adapter_record(
+        &self,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> anyhow::Result<Option<Arc<ResolvedAdapterRecord>>> {
+        let key: ResolveKey = (tenant.map(ToString::to_string), name.to_string());
+        if let Some(cached) = self.adapter_cache.get(&key).await {
+            return Ok(Some(cached));
+        }
+        let Some(a) = self.metadata.get_adapter(name, tenant).await? else {
+            return Ok(None);
+        };
+        let endpoints: Vec<ProviderEndpoint> = if let Some(ref upstream) = a.upstream {
+            // Synthesize a single endpoint so the picker has something to
+            // choose. The BackendId is derived from the URL so the same
+            // session always gets the same binding.
+            vec![ProviderEndpoint {
+                url: upstream.clone(),
+                backend_id: BackendId(format!("upstream:{upstream}")),
+            }]
+        } else {
             let handle = mcp_oxide_core::providers::DeploymentHandle {
                 id: a.name.clone(),
                 namespace: None,
                 endpoint_url: None,
             };
-            if let Ok(endpoints) = self.deployment.endpoints(&handle).await {
-                if let Some(ep) = endpoints.into_iter().next() {
-                    return Ok(Some(ResolvedAdapter {
-                        name: a.name,
-                        upstream: ep.url,
-                        required_roles: a.required_roles,
-                        tags: a.tags,
-                    }));
-                }
+            match self.deployment.endpoints(&handle).await {
+                Ok(eps) if !eps.is_empty() => eps,
+                _ => return Ok(None),
             }
-        }
-        Ok(None)
+        };
+        let record = ResolvedAdapterRecord {
+            meta: ResolvedAdapter {
+                name: a.name,
+                upstream: endpoints[0].url.clone(),
+                required_roles: a.required_roles,
+                tags: a.tags,
+            },
+            endpoints: Arc::from(endpoints.into_boxed_slice()),
+        };
+        let arc = Arc::new(record);
+        self.adapter_cache.insert(key, arc.clone()).await;
+        Ok(Some(arc))
     }
 
-    /// Resolve a tool's current routable endpoint. Returns `None` when the
-    /// tool is not registered or has no ready deployment.
     pub async fn resolve_tool_endpoint(
         &self,
         name: &str,
+        tenant: Option<&str>,
     ) -> anyhow::Result<Option<(mcp_oxide_core::tool::Tool, String)>> {
-        let Some(tool) = self.metadata.get_tool(name).await? else {
+        self.resolve_tool_endpoint_with_session(name, tenant, None)
+            .await
+    }
+
+    /// Tool-endpoint resolution honoring session affinity, with the same
+    /// caching guarantees as adapters.
+    pub async fn resolve_tool_endpoint_with_session(
+        &self,
+        name: &str,
+        tenant: Option<&str>,
+        session_id: Option<&SessionId>,
+    ) -> anyhow::Result<Option<(mcp_oxide_core::tool::Tool, String)>> {
+        let record = self.tool_record(name, tenant).await?;
+        let Some(record) = record else { return Ok(None) };
+        let Some(chosen) = self
+            .pick_endpoint(&record.tool.name, &record.endpoints, session_id)
+            .await
+        else {
+            return Ok(None);
+        };
+        Ok(Some((record.tool.clone(), chosen.url)))
+    }
+
+    async fn tool_record(
+        &self,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> anyhow::Result<Option<Arc<ResolvedToolRecord>>> {
+        let key: ResolveKey = (tenant.map(ToString::to_string), name.to_string());
+        if let Some(cached) = self.tool_cache.get(&key).await {
+            return Ok(Some(cached));
+        }
+        let Some(tool) = self.metadata.get_tool(name, tenant).await? else {
             return Ok(None);
         };
         let handle = mcp_oxide_core::providers::DeploymentHandle {
@@ -194,11 +351,101 @@ impl AppState {
             namespace: None,
             endpoint_url: None,
         };
-        let endpoints = self.deployment.endpoints(&handle).await?;
-        let Some(ep) = endpoints.into_iter().next() else {
-            return Ok(None);
+        let endpoints = match self.deployment.endpoints(&handle).await {
+            Ok(eps) if !eps.is_empty() => eps,
+            _ => return Ok(None),
         };
-        Ok(Some((tool, ep.url)))
+        let record = ResolvedToolRecord {
+            tool,
+            endpoints: Arc::from(endpoints.into_boxed_slice()),
+        };
+        let arc = Arc::new(record);
+        self.tool_cache.insert(key, arc.clone()).await;
+        Ok(Some(arc))
+    }
+
+    /// Choose one endpoint from a non-empty list. Logic:
+    /// * If exactly one endpoint exists, return it (no choice to make).
+    /// * If `session_id` is supplied and the `SessionStore` already binds
+    ///   it to a backend, prefer the endpoint whose `BackendId` matches.
+    ///   On miss, the first round-robin pick is bound for the next call.
+    /// * Otherwise round-robin across endpoints by target name.
+    pub async fn pick_endpoint(
+        &self,
+        target: &str,
+        endpoints: &[ProviderEndpoint],
+        session_id: Option<&SessionId>,
+    ) -> Option<ProviderEndpoint> {
+        if endpoints.is_empty() {
+            return None;
+        }
+        if endpoints.len() == 1 {
+            // Still record the binding so a later replica scale-out preserves
+            // the session's stickiness.
+            if let Some(sid) = session_id {
+                let _ = self
+                    .session
+                    .bind(
+                        sid,
+                        target,
+                        endpoints[0].backend_id.clone(),
+                        SESSION_BIND_TTL,
+                    )
+                    .await;
+            }
+            return Some(endpoints[0].clone());
+        }
+        if let Some(sid) = session_id {
+            if let Ok(Some(bound)) = self.session.resolve(sid, target).await {
+                if let Some(ep) = endpoints.iter().find(|e| e.backend_id == bound) {
+                    return Some(ep.clone());
+                }
+                // Bound backend has gone away — fall through to fresh pick.
+            }
+            let chosen = self.round_robin_pick(target, endpoints);
+            let _ = self
+                .session
+                .bind(
+                    sid,
+                    target,
+                    chosen.backend_id.clone(),
+                    SESSION_BIND_TTL,
+                )
+                .await;
+            return Some(chosen);
+        }
+        Some(self.round_robin_pick(target, endpoints))
+    }
+
+    fn round_robin_pick(&self, target: &str, endpoints: &[ProviderEndpoint]) -> ProviderEndpoint {
+        let idx = {
+            let read = self.rr_counters.read();
+            if let Some(c) = read.get(target) {
+                c.fetch_add(1, Ordering::Relaxed)
+            } else {
+                drop(read);
+                let mut write = self.rr_counters.write();
+                write
+                    .entry(target.to_string())
+                    .or_insert_with(|| AtomicUsize::new(0))
+                    .fetch_add(1, Ordering::Relaxed)
+            }
+        };
+        endpoints[idx % endpoints.len()].clone()
+    }
+
+    /// Drop any cached resolution for the given adapter. Called by the
+    /// control plane after a successful create/update/delete so subsequent
+    /// data-plane traffic sees the new state immediately.
+    pub async fn invalidate_adapter(&self, tenant: Option<&str>, name: &str) {
+        let key: ResolveKey = (tenant.map(ToString::to_string), name.to_string());
+        self.adapter_cache.invalidate(&key).await;
+    }
+
+    /// Drop any cached resolution for the given tool.
+    pub async fn invalidate_tool(&self, tenant: Option<&str>, name: &str) {
+        let key: ResolveKey = (tenant.map(ToString::to_string), name.to_string());
+        self.tool_cache.invalidate(&key).await;
     }
 }
 
@@ -268,6 +515,9 @@ impl AppStateBuilder {
             http,
             adapters: Arc::new(map),
             started_at: std::time::Instant::now(),
+            adapter_cache: build_resolve_cache(),
+            tool_cache: build_resolve_cache(),
+            rr_counters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
     }
 }

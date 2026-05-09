@@ -18,6 +18,8 @@ Thumbs.db
 *.db
 /tmp/
 /dist/
+frontend/dist/
+frontend/node_modules/
 
 # Logs
 *.log

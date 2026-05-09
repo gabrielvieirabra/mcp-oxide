@@ -7,6 +7,11 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Adapter {
     pub name: String,
+    /// Owning tenant. `None` means the adapter is global (e.g. a static
+    /// config entry shared by every authenticated caller). When set, only
+    /// callers whose `UserContext.tenant` matches can list/read/mutate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub image: ImageRef,

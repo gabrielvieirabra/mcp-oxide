@@ -456,17 +456,35 @@ Scope: route traffic to **pre-registered (config-file)** adapters. No control pl
 ---
 
 ### Phase 3 — DeploymentProvider + Tool Router (5–6d)
-- `DeploymentProvider` trait; first-party impls: `kubernetes`, `docker`, `noop-external`.
-- **Kubernetes impl**: `kube` crate; adapters materialized as `StatefulSet` + headless `Service` + `ConfigMap`/`Secret` (+ optional `ServiceAccount` per adapter); ownerReferences for GC; `Event` emission; log streaming via `Pod/log` subresource; status watched via `kube::runtime::watcher`.
-- Reconciler loop with `Controller::run`: desired (MetadataStore) → actual (provider), exponential backoff + status events; leader-elected via `Lease` (phase 11 promotes to production hardening).
-- `/adapters/{n}/status` and `/adapters/{n}/logs` (SSE).
-- **Tool Gateway Router** implemented as an in-process MCP server that:
-  - Aggregates `tools/list` from registered tools.
-  - Dispatches `tools/call` to the tool's endpoint.
-  - Runs in N replicas with session affinity when horizontally scaled.
-- `ImageRegistry` abstraction + Docker/K8s pull (K8s uses `imagePullSecrets` resolved via `SecretProvider`).
 
-**DoD**: registering a tool via API causes it to be deployed and callable at `POST /mcp` without a gateway restart.
+> **Status: PARTIAL — Kubernetes impl, reconciler, and `/status`+`/logs` SSE moved to Phase 3.5.** Items below were delivered via commits `b99f563` (control-plane CRUD, MetadataStore, providers, tool router) and `adadce7` (security/correctness/perf hardening). The DoD below is **not** met yet — see Phase 3.5.
+
+- `DeploymentProvider` trait; first-party impls: `kubernetes`, `docker`, `noop-external`.
+- **Kubernetes impl**: `kube` crate; adapters materialized as `StatefulSet` + headless `Service` + `ConfigMap`/`Secret` (+ optional `ServiceAccount` per adapter); ownerReferences for GC; `Event` emission; log streaming via `Pod/log` subresource; status watched via `kube::runtime::watcher`. **→ Phase 3.5.**
+- Reconciler loop with `Controller::run`: desired (MetadataStore) → actual (provider), exponential backoff + status events; leader-elected via `Lease` (phase 11 promotes to production hardening). **→ Phase 3.5.**
+- `/adapters/{n}/status` and `/adapters/{n}/logs` (SSE). **→ Phase 3.5.**
+- **Tool Gateway Router** implemented as an in-process MCP server that:
+  - Aggregates `tools/list` from registered tools. _Done._
+  - Dispatches `tools/call` to the tool's endpoint. _Done._
+  - Runs in N replicas with session affinity when horizontally scaled. _Done — `mcp-session-id` header drives sticky binding via `SessionStore` with round-robin fallback._
+- `ImageRegistry` abstraction + Docker/K8s pull (K8s uses `imagePullSecrets` resolved via `SecretProvider`). **→ Phase 3.5.**
+
+**DoD (original)**: registering a tool via API causes it to be deployed and callable at `POST /mcp` without a gateway restart.
+**Status**: ✗ — works for the Docker provider in single-replica steady state, but no automatic reconciliation on drift/failure. Closed honestly in Phase 3.5.
+
+---
+
+### Phase 3.5 — Reconciler & Kubernetes Provider (5–8d)
+
+Closes the Phase 3 DoD. Carved out as a separate phase because (a) it materially changes the deploy story (the gateway becomes a controller), (b) it depends on the K8s `kube` + `kube-runtime` crates and tightens the binary's CVE surface, and (c) Phase 4 (observability) depends on having reconciler signals to instrument.
+
+- **Kubernetes `DeploymentProvider`** behind a `kubernetes` cargo feature: `kube` + `kube-runtime`; adapters/tools materialised as `StatefulSet` + headless `Service` + `ConfigMap`/`Secret` (+ per-resource `ServiceAccount` when configured); `ownerReferences` so deletion cascades; `Event` emission; log streaming via `Pod/log` subresource.
+- **Reconciler** with `kube_runtime::Controller::run` driving desired (MetadataStore) → actual (provider), exponential backoff, status events, and idempotent `apply`. Multi-replica safe via `Lease`-based leader election (`kube::runtime::leader_election` or equivalent).
+- **`/adapters/{n}/status` and `/adapters/{n}/logs` (SSE)** wired to the K8s `Pod/log` and `status` subresources, with cancel-on-disconnect and per-connection budgets.
+- **Docker provider hardening (audit H4)**: compensating cleanup on partial-create failure; healthcheck poll before declaring `Ready`; revalidate endpoint URL on every `apply`; surface structured `DeploymentStatus` (not string-typed).
+- **`ImageRegistry` impls**: anonymous + token (Docker Hub), AWS ECR, GCP AR, Azure ACR, Harbor; private-registry auth resolved via `SecretProvider` and injected as `imagePullSecrets` on K8s.
+
+**DoD**: from a clean cluster, `POST /tools` → reconciler picks up the desired state → `StatefulSet` rolls out → `tools/call` reaches the new pod within ~30s, with the path surviving a single replica crash without manual intervention. e2e test that today only exercises in-process tool routing extends to deploy a real container and assert end-to-end.
 
 ---
 

@@ -36,6 +36,28 @@ fn make_token(sub: &str, roles: &[&str]) -> String {
     .unwrap()
 }
 
+fn make_token_tenant(sub: &str, tenant: &str, roles: &[&str]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = json!({
+        "sub": sub,
+        "iss": ISSUER,
+        "aud": AUD,
+        "iat": now,
+        "exp": now + 60,
+        "tenant": tenant,
+        "roles": roles,
+    });
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(HS_SECRET),
+    )
+    .unwrap()
+}
+
 fn build_state() -> AppState {
     let identity: Arc<dyn IdProvider> = Arc::new(StaticJwtProvider::new(StaticJwtConfig {
         algorithm: Algorithm::HS256,
@@ -948,3 +970,141 @@ async fn create_adapter_valid_name_sets_location_header() {
     assert_eq!(loc, "/adapters/a-valid-123");
 }
 
+/// C1 regression: an admin in tenant A must NOT be able to read, update, or
+/// delete an adapter that belongs to tenant B. The expected response is 404
+/// (NOT 403) because exposing existence-of-resource across tenants is itself
+/// a confidentiality leak.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cross_tenant_isolation_for_adapter_crud() {
+    let state = build_state();
+    let app = router(state);
+
+    let acme = make_token_tenant("alice", "acme", &["mcp.admin"]);
+    let other = make_token_tenant("bob", "other", &["mcp.admin"]);
+
+    let body = |name: &str, upstream: &str| {
+        serde_json::to_vec(&json!({
+            "name": name,
+            "image": "registry.example.com/x:1",
+            "upstream": upstream,
+        }))
+        .unwrap()
+    };
+
+    // Alice@acme creates "weather".
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/adapters")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {acme}"))
+                .body(axum::body::Body::from(body("weather", "http://acme/mcp")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Bob@other GET /adapters/weather → 404 (not 403, not 200).
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/adapters/weather")
+                .header("Authorization", format!("Bearer {other}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Bob@other DELETE /adapters/weather → 404 too. (No-op, no leak.)
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/adapters/weather")
+                .header("Authorization", format!("Bearer {other}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Bob@other CAN create their own adapter with the SAME name. Composite
+    // key (tenant, name) makes this allowed.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/adapters")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {other}"))
+                .body(axum::body::Body::from(body("weather", "http://other/mcp")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Each tenant lists exactly one — their own.
+    for token in [&acme, &other] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/adapters")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "each tenant must see exactly one row, got {v}");
+        assert_eq!(arr[0]["name"], "weather");
+    }
+
+    // Alice deletes her own; Bob's row is untouched.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/adapters/weather")
+                .header("Authorization", format!("Bearer {acme}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/adapters/weather")
+                .header("Authorization", format!("Bearer {other}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

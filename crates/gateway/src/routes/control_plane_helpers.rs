@@ -86,6 +86,11 @@ pub async fn authorize(
         resource: Resource {
             kind: kind.resource_kind(),
             name,
+            // Operate within the caller's tenant. The store is also
+            // tenant-scoped, so this is defence-in-depth: a future ABAC
+            // rule that explicitly checks `resource.tenant == user.tenant`
+            // doesn't need handler changes.
+            tenant: user.tenant.as_deref(),
             tags: tags.to_vec(),
             required_roles: vec![],
         },

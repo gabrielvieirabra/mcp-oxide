@@ -8,7 +8,22 @@ use mcp_oxide_core::{
     audit::{AuditDecision, AuditRecord, AuditTarget, AuditUser},
     identity::UserContext,
     policy::{Action, Env, Plane, PolicyInput, Resource, ResourceKind},
+    session::SessionId,
 };
+
+/// Header name carrying the MCP session id used for sticky routing across
+/// gateway replicas and within a multi-replica backend deployment.
+pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
+
+/// Extract the MCP session id from request headers. Returns `None` when the
+/// header is absent or contains non-printable bytes; the data plane treats
+/// that as "no session affinity requested".
+pub fn extract_session_id(headers: &HeaderMap) -> Option<SessionId> {
+    headers
+        .get(MCP_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| SessionId(s.to_string()))
+}
 
 use crate::state::AppState;
 
@@ -50,6 +65,7 @@ pub async fn authorize_data_plane(
         resource: Resource {
             kind: target_kind,
             name: target_name,
+            tenant: user.tenant.as_deref(),
             tags: target_tags.to_vec(),
             required_roles: required_roles.to_vec(),
         },

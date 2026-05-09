@@ -12,7 +12,9 @@ use crate::policy::{Decision, PolicyInput};
 use crate::session::{BackendId, SessionId};
 use crate::tool::Tool;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -55,10 +57,21 @@ pub struct DeploymentSpec {
     pub tool: Option<Tool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeploymentKind {
     Adapter,
     Tool,
+}
+
+impl DeploymentKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeploymentKind::Adapter => "adapter",
+            DeploymentKind::Tool => "tool",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,12 +87,22 @@ pub struct DeploymentHandle {
     pub endpoint_url: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentStatus {
     pub ready: bool,
     pub replicas: u32,
     pub ready_replicas: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Persisted snapshot of a deployment's last observed status. The reconciler
+/// writes one of these on every successful (or unsuccessful) probe so the
+/// `/status` endpoint can answer without waking the provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentStatusRecord {
+    pub status: DeploymentStatus,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,15 +139,40 @@ pub struct Filter {
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Insert (only if absent) — returns `Conflict` if `(tenant, name)` exists.
     async fn put_adapter(&self, a: &Adapter) -> Result<()>;
-    async fn get_adapter(&self, name: &str) -> Result<Option<Adapter>>;
+    /// Atomic compare-and-swap update. Returns `Conflict` when the stored
+    /// revision differs from `expected_revision`. The caller is expected to
+    /// have already incremented `a.revision` to the new value before calling.
+    async fn update_adapter_cas(&self, a: &Adapter, expected_revision: u64) -> Result<()>;
+    async fn get_adapter(&self, name: &str, tenant: Option<&str>) -> Result<Option<Adapter>>;
     async fn list_adapters(&self, filter: &Filter) -> Result<Vec<Adapter>>;
-    async fn delete_adapter(&self, name: &str) -> Result<()>;
+    async fn delete_adapter(&self, name: &str, tenant: Option<&str>) -> Result<()>;
 
     async fn put_tool(&self, t: &Tool) -> Result<()>;
-    async fn get_tool(&self, name: &str) -> Result<Option<Tool>>;
+    async fn update_tool_cas(&self, t: &Tool, expected_revision: u64) -> Result<()>;
+    async fn get_tool(&self, name: &str, tenant: Option<&str>) -> Result<Option<Tool>>;
     async fn list_tools(&self, filter: &Filter) -> Result<Vec<Tool>>;
-    async fn delete_tool(&self, name: &str) -> Result<()>;
+    async fn delete_tool(&self, name: &str, tenant: Option<&str>) -> Result<()>;
+
+    /// Persist the last status observed by the reconciler. Idempotent —
+    /// callers always overwrite. Identified by `(kind, tenant, name)` so an
+    /// adapter and a tool can share a name across kinds.
+    async fn record_status(
+        &self,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+        record: &DeploymentStatusRecord,
+    ) -> Result<()>;
+
+    /// Read back the last persisted status, if any.
+    async fn get_status(
+        &self,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> Result<Option<DeploymentStatusRecord>>;
 
     fn kind(&self) -> &'static str;
 }
@@ -290,6 +338,22 @@ pub trait AuditSink: Send + Sync {
 pub trait ImageRegistry: Send + Sync {
     /// Resolve a tag to an immutable digest reference.
     async fn resolve(&self, reference: &str) -> Result<String>;
+    fn kind(&self) -> &'static str;
+}
+
+// ---------------------------------------------------------------------------
+// Leader election
+// ---------------------------------------------------------------------------
+
+/// Coordinates which gateway replica drives the reconciler. A single-replica
+/// deployment uses an in-process implementation that is always leader; a
+/// multi-replica deployment plugs in a `Lease`-backed implementation
+/// (Phase 3.5c). The reconciler queries `is_leader` before every tick and
+/// no-ops when it loses leadership so the lease holder is the only writer
+/// against the `DeploymentProvider`.
+#[async_trait]
+pub trait LeaderLock: Send + Sync {
+    async fn is_leader(&self) -> bool;
     fn kind(&self) -> &'static str;
 }
 

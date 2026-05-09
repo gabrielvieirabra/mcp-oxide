@@ -17,6 +17,18 @@ lint:
     cargo clippy --all-targets --features docker -- -D warnings
     cargo clippy --all-targets --no-default-features -- -D warnings
 
+# Run the operator console frontend.
+frontend-dev:
+    cd frontend && npm run dev
+
+# Build the operator console frontend.
+frontend-build:
+    cd frontend && npm run build
+
+# Lint the operator console frontend.
+frontend-lint:
+    cd frontend && npm run lint
+
 # Start the smoke-test docker-compose stack.
 smoke-up:
     docker compose -f deploy/smoke/docker-compose.yaml up --build -d
