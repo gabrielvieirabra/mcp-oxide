@@ -10,6 +10,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod proxy;
+pub mod reconciler;
 pub mod routes;
 pub mod state;
 

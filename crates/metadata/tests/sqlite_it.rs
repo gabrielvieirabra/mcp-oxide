@@ -4,7 +4,9 @@
 
 use mcp_oxide_core::{
     adapter::{Adapter, Endpoint, ImageRef},
-    providers::{Filter, MetadataStore},
+    providers::{
+        DeploymentKind, DeploymentStatus, DeploymentStatusRecord, Filter, MetadataStore,
+    },
     Error,
 };
 use mcp_oxide_metadata::SqliteMetadataStore;
@@ -193,3 +195,108 @@ async fn sqlite_persists_across_reconnect() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn sqlite_deployment_status_roundtrip_and_tenant_scope() {
+    let store = SqliteMetadataStore::connect("sqlite::memory:").await.unwrap();
+
+    let now = chrono::Utc::now();
+    let acme = DeploymentStatusRecord {
+        status: DeploymentStatus {
+            ready: true,
+            replicas: 2,
+            ready_replicas: 2,
+            message: Some("acme-ok".into()),
+        },
+        observed_at: now,
+    };
+    let other = DeploymentStatusRecord {
+        status: DeploymentStatus {
+            ready: false,
+            replicas: 1,
+            ready_replicas: 0,
+            message: Some("other-pending".into()),
+        },
+        observed_at: now,
+    };
+
+    store
+        .record_status(DeploymentKind::Adapter, "weather", Some("acme"), &acme)
+        .await
+        .unwrap();
+    store
+        .record_status(DeploymentKind::Adapter, "weather", Some("other"), &other)
+        .await
+        .unwrap();
+
+    // Tenant-scoped read returns only that tenant's record.
+    let got = store
+        .get_status(DeploymentKind::Adapter, "weather", Some("acme"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(got.status.ready);
+    assert_eq!(got.status.ready_replicas, 2);
+    assert_eq!(got.status.message.as_deref(), Some("acme-ok"));
+
+    let got = store
+        .get_status(DeploymentKind::Adapter, "weather", Some("other"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!got.status.ready);
+    assert_eq!(got.status.message.as_deref(), Some("other-pending"));
+
+    // Different kind, same name + tenant: separate row.
+    let tool_record = DeploymentStatusRecord {
+        status: DeploymentStatus {
+            ready: true,
+            replicas: 1,
+            ready_replicas: 1,
+            message: None,
+        },
+        observed_at: now,
+    };
+    store
+        .record_status(DeploymentKind::Tool, "weather", Some("acme"), &tool_record)
+        .await
+        .unwrap();
+    assert_ne!(
+        store
+            .get_status(DeploymentKind::Adapter, "weather", Some("acme"))
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .message,
+        store
+            .get_status(DeploymentKind::Tool, "weather", Some("acme"))
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .message
+    );
+
+    // Idempotent overwrite.
+    let mut later = acme.clone();
+    later.status.ready_replicas = 3;
+    store
+        .record_status(DeploymentKind::Adapter, "weather", Some("acme"), &later)
+        .await
+        .unwrap();
+    let got = store
+        .get_status(DeploymentKind::Adapter, "weather", Some("acme"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.status.ready_replicas, 3);
+
+    // Missing row returns None.
+    assert!(store
+        .get_status(DeploymentKind::Adapter, "missing", Some("acme"))
+        .await
+        .unwrap()
+        .is_none());
+}
+

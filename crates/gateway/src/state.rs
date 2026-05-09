@@ -176,6 +176,20 @@ impl AppState {
             static_adapters = s.adapters.len(),
             "providers wired"
         );
+
+        // Spawn the reconciler. Single-replica gateways always lead; the
+        // K8s-leased implementation lands in Phase 3.5c. Tests use
+        // `AppState::builder()` which does NOT start a reconciler so
+        // existing assertions stay deterministic.
+        let leader: Arc<dyn mcp_oxide_core::providers::LeaderLock> =
+            Arc::new(crate::reconciler::InProcessLeader);
+        let reconciler = crate::reconciler::Reconciler::new(
+            s.clone(),
+            leader,
+            crate::reconciler::ReconcilerConfig::default(),
+        );
+        let _ = reconciler.spawn();
+
         Ok(s)
     }
 

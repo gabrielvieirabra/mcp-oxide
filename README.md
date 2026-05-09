@@ -33,6 +33,21 @@ helm install mcp-oxide deploy/helm/mcp-oxide \
   -f deploy/helm/mcp-oxide/values-prod.yaml
 ```
 
+## Frontend console
+
+The operator console lives in [`frontend`](./frontend). It is a React +
+TypeScript + Vite app that talks to the gateway API and stores only local
+connection settings in the browser.
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+With the gateway running on `:8080`, the Vite dev server proxies API calls
+from `:5173`.
+
 ## Docs
 - [`docs/adr/`](./docs/adr) — architectural decision records
 - [`openapi/mcp-oxide.openapi.yaml`](./openapi/mcp-oxide.openapi.yaml) — API spec

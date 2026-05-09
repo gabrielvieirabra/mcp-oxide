@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use mcp_oxide_core::{
     adapter::Adapter,
-    providers::{Filter, MetadataStore},
+    providers::{DeploymentKind, DeploymentStatusRecord, Filter, MetadataStore},
     tool::Tool,
     Error, Result,
 };
@@ -17,11 +17,13 @@ use std::collections::BTreeMap;
 /// merge tenants on lookup — a `(Some("acme"), "weather")` row is invisible
 /// to a caller passing `tenant = Some("other")`.
 type Key = (Option<String>, String);
+type StatusKey = (DeploymentKind, Option<String>, String);
 
 #[derive(Debug, Default)]
 pub struct InMemoryMetadataStore {
     adapters: RwLock<BTreeMap<Key, Adapter>>,
     tools: RwLock<BTreeMap<Key, Tool>>,
+    statuses: RwLock<BTreeMap<StatusKey, DeploymentStatusRecord>>,
 }
 
 impl InMemoryMetadataStore {
@@ -145,6 +147,28 @@ impl MetadataStore for InMemoryMetadataStore {
     async fn delete_tool(&self, name: &str, tenant: Option<&str>) -> Result<()> {
         self.tools.write().remove(&key(tenant, name));
         Ok(())
+    }
+
+    async fn record_status(
+        &self,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+        record: &DeploymentStatusRecord,
+    ) -> Result<()> {
+        let k = (kind, tenant.map(ToString::to_string), name.to_string());
+        self.statuses.write().insert(k, record.clone());
+        Ok(())
+    }
+
+    async fn get_status(
+        &self,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> Result<Option<DeploymentStatusRecord>> {
+        let k = (kind, tenant.map(ToString::to_string), name.to_string());
+        Ok(self.statuses.read().get(&k).cloned())
     }
 
     fn kind(&self) -> &'static str {

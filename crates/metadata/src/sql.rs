@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use mcp_oxide_core::{
     adapter::Adapter,
-    providers::{Filter, MetadataStore},
+    providers::{DeploymentKind, DeploymentStatusRecord, Filter, MetadataStore},
     tool::Tool,
     Error, Result,
 };
@@ -58,6 +58,19 @@ pub trait SqlBackend: Send + Sync + 'static {
     ) -> Result<Option<Tool>>;
     async fn list_tools(pool: &Pool<Self::Db>, filter: &Filter) -> Result<Vec<Tool>>;
     async fn delete_tool(pool: &Pool<Self::Db>, name: &str, tenant: Option<&str>) -> Result<()>;
+    async fn record_status(
+        pool: &Pool<Self::Db>,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+        record: &DeploymentStatusRecord,
+    ) -> Result<()>;
+    async fn get_status(
+        pool: &Pool<Self::Db>,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> Result<Option<DeploymentStatusRecord>>;
 }
 
 /// Generic SQL metadata store.
@@ -116,6 +129,23 @@ impl<B: SqlBackend> MetadataStore for SqlMetadataStore<B> {
     async fn delete_tool(&self, name: &str, tenant: Option<&str>) -> Result<()> {
         B::delete_tool(&self.pool, name, tenant).await
     }
+    async fn record_status(
+        &self,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+        record: &DeploymentStatusRecord,
+    ) -> Result<()> {
+        B::record_status(&self.pool, kind, name, tenant, record).await
+    }
+    async fn get_status(
+        &self,
+        kind: DeploymentKind,
+        name: &str,
+        tenant: Option<&str>,
+    ) -> Result<Option<DeploymentStatusRecord>> {
+        B::get_status(&self.pool, kind, name, tenant).await
+    }
     fn kind(&self) -> &'static str {
         B::kind_str()
     }
@@ -143,9 +173,10 @@ pub mod sqlite {
         dec_tenant, enc_tenant, json_decode, json_encode, map_sqlx_err, SqlBackend, TENANT_NONE,
     };
     use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
     use mcp_oxide_core::{
         adapter::Adapter,
-        providers::Filter,
+        providers::{DeploymentKind, DeploymentStatus, DeploymentStatusRecord, Filter},
         tool::Tool,
         Error, Result,
     };
@@ -182,6 +213,17 @@ CREATE TABLE IF NOT EXISTS tools (
     PRIMARY KEY (tenant, name)
 );
 CREATE INDEX IF NOT EXISTS idx_tools_tenant ON tools(tenant);
+CREATE TABLE IF NOT EXISTS deployment_status (
+    kind            TEXT NOT NULL,
+    tenant          TEXT NOT NULL DEFAULT '',
+    name            TEXT NOT NULL,
+    ready           INTEGER NOT NULL,
+    replicas        INTEGER NOT NULL,
+    ready_replicas  INTEGER NOT NULL,
+    message         TEXT,
+    observed_at     TEXT NOT NULL,
+    PRIMARY KEY (kind, tenant, name)
+);
 ";
 
     #[async_trait]
@@ -461,6 +503,79 @@ CREATE INDEX IF NOT EXISTS idx_tools_tenant ON tools(tenant);
                 .await
                 .map_err(|e| map_sqlx_err(&e))?;
             Ok(())
+        }
+
+        async fn record_status(
+            pool: &Pool<Sqlite>,
+            kind: DeploymentKind,
+            name: &str,
+            tenant: Option<&str>,
+            record: &DeploymentStatusRecord,
+        ) -> Result<()> {
+            let observed = record.observed_at.to_rfc3339();
+            sqlx::query(
+                "INSERT INTO deployment_status \
+                 (kind, tenant, name, ready, replicas, ready_replicas, message, observed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(kind, tenant, name) DO UPDATE SET \
+                   ready          = excluded.ready, \
+                   replicas       = excluded.replicas, \
+                   ready_replicas = excluded.ready_replicas, \
+                   message        = excluded.message, \
+                   observed_at    = excluded.observed_at",
+            )
+            .bind(kind.as_str())
+            .bind(enc_tenant(tenant))
+            .bind(name)
+            .bind(i64::from(record.status.ready))
+            .bind(i64::from(record.status.replicas))
+            .bind(i64::from(record.status.ready_replicas))
+            .bind(record.status.message.as_deref())
+            .bind(observed)
+            .execute(pool)
+            .await
+            .map_err(|e| map_sqlx_err(&e))?;
+            Ok(())
+        }
+
+        async fn get_status(
+            pool: &Pool<Sqlite>,
+            kind: DeploymentKind,
+            name: &str,
+            tenant: Option<&str>,
+        ) -> Result<Option<DeploymentStatusRecord>> {
+            let row = sqlx::query(
+                "SELECT ready, replicas, ready_replicas, message, observed_at \
+                 FROM deployment_status \
+                 WHERE kind = ?1 AND tenant = ?2 AND name = ?3",
+            )
+            .bind(kind.as_str())
+            .bind(enc_tenant(tenant))
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| map_sqlx_err(&e))?;
+            let _ = TENANT_NONE; // referenced for parity with adapter list path
+            let Some(r) = row else { return Ok(None) };
+            let ready: i64 = r.try_get("ready").map_err(|e| map_sqlx_err(&e))?;
+            let replicas: i64 = r.try_get("replicas").map_err(|e| map_sqlx_err(&e))?;
+            let ready_replicas: i64 = r.try_get("ready_replicas").map_err(|e| map_sqlx_err(&e))?;
+            let message: Option<String> = r.try_get("message").map_err(|e| map_sqlx_err(&e))?;
+            let observed: String = r.try_get("observed_at").map_err(|e| map_sqlx_err(&e))?;
+            let observed_at = DateTime::parse_from_rfc3339(&observed)
+                .map_err(|e| Error::Internal(format!("observed_at parse: {e}")))?
+                .with_timezone(&Utc);
+            Ok(Some(DeploymentStatusRecord {
+                status: DeploymentStatus {
+                    ready: ready != 0,
+                    #[allow(clippy::cast_sign_loss)]
+                    replicas: u32::try_from(replicas).unwrap_or(0),
+                    #[allow(clippy::cast_sign_loss)]
+                    ready_replicas: u32::try_from(ready_replicas).unwrap_or(0),
+                    message,
+                },
+                observed_at,
+            }))
         }
     }
 
