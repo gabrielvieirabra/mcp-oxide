@@ -116,15 +116,21 @@ pub struct Filter {
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Insert (only if absent) — returns `Conflict` if `(tenant, name)` exists.
     async fn put_adapter(&self, a: &Adapter) -> Result<()>;
-    async fn get_adapter(&self, name: &str) -> Result<Option<Adapter>>;
+    /// Atomic compare-and-swap update. Returns `Conflict` when the stored
+    /// revision differs from `expected_revision`. The caller is expected to
+    /// have already incremented `a.revision` to the new value before calling.
+    async fn update_adapter_cas(&self, a: &Adapter, expected_revision: u64) -> Result<()>;
+    async fn get_adapter(&self, name: &str, tenant: Option<&str>) -> Result<Option<Adapter>>;
     async fn list_adapters(&self, filter: &Filter) -> Result<Vec<Adapter>>;
-    async fn delete_adapter(&self, name: &str) -> Result<()>;
+    async fn delete_adapter(&self, name: &str, tenant: Option<&str>) -> Result<()>;
 
     async fn put_tool(&self, t: &Tool) -> Result<()>;
-    async fn get_tool(&self, name: &str) -> Result<Option<Tool>>;
+    async fn update_tool_cas(&self, t: &Tool, expected_revision: u64) -> Result<()>;
+    async fn get_tool(&self, name: &str, tenant: Option<&str>) -> Result<Option<Tool>>;
     async fn list_tools(&self, filter: &Filter) -> Result<Vec<Tool>>;
-    async fn delete_tool(&self, name: &str) -> Result<()>;
+    async fn delete_tool(&self, name: &str, tenant: Option<&str>) -> Result<()>;
 
     fn kind(&self) -> &'static str;
 }

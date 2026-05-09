@@ -342,7 +342,7 @@ pub async fn list_adapters(
             return Err(e);
         }
     }
-    let filter = Filter { tenant: None, tags: parse_tags(query.tags) };
+    let filter = Filter { tenant: user.tenant.clone(), tags: parse_tags(query.tags) };
     let adapters = state.metadata.list_adapters(&filter).await?;
     Ok(Json(adapters.iter().map(AdapterResponse::from).collect()))
 }
@@ -385,7 +385,8 @@ pub async fn create_adapter(
         }
     };
 
-    let existing = state.metadata.get_adapter(&body.name).await?;
+    let tenant = user.tenant.clone();
+    let existing = state.metadata.get_adapter(&body.name, tenant.as_deref()).await?;
     if existing.is_some() {
         let err = AppError::Core(mcp_oxide_core::Error::Conflict(format!("adapter '{}' already exists", body.name)));
         emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
@@ -395,6 +396,7 @@ pub async fn create_adapter(
     let now = Utc::now();
     let adapter = Adapter {
         name: body.name.clone(),
+        tenant: tenant.clone(),
         description: body.description,
         image: ImageRef { reference: body.image.clone() },
         endpoint: Endpoint { port: body.endpoint_port, path: body.endpoint_path.clone() },
@@ -433,13 +435,14 @@ pub async fn create_adapter(
         if let Err(e) = state.deployment.apply(&spec).await {
             // Roll back metadata so we don't expose an adapter that can
             // never be routed to.
-            let _ = state.metadata.delete_adapter(&body.name).await;
+            let _ = state.metadata.delete_adapter(&body.name, tenant.as_deref()).await;
             let err = AppError::Core(e);
             emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
             return Err(err);
         }
     }
 
+    state.invalidate_adapter(tenant.as_deref(), &body.name).await;
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Create, &body.name, AuditDecision::Allow, policy_id, None).await;
 
     let resp = AdapterResponse::from(&adapter);
@@ -467,7 +470,7 @@ pub async fn get_adapter(
             return Err(e);
         }
     };
-    let adapter = state.metadata.get_adapter(&name).await?
+    let adapter = state.metadata.get_adapter(&name, user.tenant.as_deref()).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("adapter '{name}'")))?;
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Read, &name, AuditDecision::Allow, policy_id, None).await;
     let rev = adapter.revision.unwrap_or(0);
@@ -508,9 +511,14 @@ pub async fn update_adapter(
     // If-Match header takes precedence over body.revision.
     let header_rev = parse_if_match(&headers)?;
 
-    let mut adapter = state.metadata.get_adapter(&name).await?
+    let tenant = user.tenant.clone();
+    let mut adapter = state.metadata.get_adapter(&name, tenant.as_deref()).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("adapter '{name}'")))?;
 
+    // Eager check covers the "client already supplied wrong revision"
+    // case so we can return 412 before touching the deployment provider.
+    // The atomic CAS in `update_adapter_cas` is still authoritative for
+    // races between two concurrent updaters.
     let expected = header_rev.or(body.revision);
     if let Some(rev) = expected {
         if Some(rev) != adapter.revision {
@@ -519,6 +527,7 @@ pub async fn update_adapter(
             return Err(err);
         }
     }
+    let prev_revision = adapter.revision.unwrap_or(0);
 
     let now = Utc::now();
     let prev_created = adapter.created_at;
@@ -559,12 +568,20 @@ pub async fn update_adapter(
         || prev_resources.memory != adapter.resources.memory
         || prev_upstream != adapter.upstream;
 
-    let new_rev = adapter.revision.unwrap_or(0) + 1;
+    let new_rev = prev_revision + 1;
     adapter.revision = Some(new_rev);
     adapter.updated_at = Some(now);
     adapter.created_at = prev_created;
+    // tenant on a stored adapter is owned by its tenant column; preserve it
+    // explicitly so a malformed JSON payload from a prior version cannot
+    // strip it out on roundtrip.
+    adapter.tenant.clone_from(&tenant);
 
-    state.metadata.put_adapter(&adapter).await?;
+    if let Err(e) = state.metadata.update_adapter_cas(&adapter, prev_revision).await {
+        let err = AppError::Core(e);
+        emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Update, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+        return Err(err);
+    }
 
     // B6: re-apply the deployment if any field that affects the running
     // container changed. If the adapter uses an explicit external upstream
@@ -583,6 +600,7 @@ pub async fn update_adapter(
         }
     }
 
+    state.invalidate_adapter(tenant.as_deref(), &name).await;
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Update, &name, AuditDecision::Allow, policy_id, None).await;
     Ok((
         StatusCode::OK,
@@ -606,7 +624,8 @@ pub async fn delete_adapter(
         }
     };
 
-    let existing = state.metadata.get_adapter(&name).await?;
+    let tenant = user.tenant.clone();
+    let existing = state.metadata.get_adapter(&name, tenant.as_deref()).await?;
     let Some(existing) = existing else {
         let err = AppError::Core(mcp_oxide_core::Error::NotFound(format!("adapter '{name}'")));
         emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Delete, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
@@ -641,7 +660,8 @@ pub async fn delete_adapter(
         }
     }
 
-    state.metadata.delete_adapter(&name).await?;
+    state.metadata.delete_adapter(&name, tenant.as_deref()).await?;
+    state.invalidate_adapter(tenant.as_deref(), &name).await;
     emit_audit(&state, &trace_id, &user, CpKind::Adapter, CpVerb::Delete, &name, AuditDecision::Allow, policy_id, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -662,7 +682,7 @@ pub async fn list_tools(
             return Err(e);
         }
     }
-    let filter = Filter { tenant: None, tags: parse_tags(query.tags) };
+    let filter = Filter { tenant: user.tenant.clone(), tags: parse_tags(query.tags) };
     let tools = state.metadata.list_tools(&filter).await?;
     Ok(Json(tools.iter().map(ToolResponse::from).collect()))
 }
@@ -702,7 +722,8 @@ pub async fn create_tool(
         }
     };
 
-    let existing = state.metadata.get_tool(&body.name).await?;
+    let tenant = user.tenant.clone();
+    let existing = state.metadata.get_tool(&body.name, tenant.as_deref()).await?;
     if existing.is_some() {
         let err = AppError::Core(mcp_oxide_core::Error::Conflict(format!("tool '{}' already exists", body.name)));
         emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
@@ -712,6 +733,7 @@ pub async fn create_tool(
     let now = Utc::now();
     let tool = Tool {
         name: body.name.clone(),
+        tenant: tenant.clone(),
         description: body.description,
         image: ImageRef { reference: body.image },
         endpoint: Endpoint { port: body.endpoint_port, path: body.endpoint_path },
@@ -742,12 +764,13 @@ pub async fn create_tool(
         tool: Some(tool.clone()),
     };
     if let Err(e) = state.deployment.apply(&spec).await {
-        let _ = state.metadata.delete_tool(&body.name).await;
+        let _ = state.metadata.delete_tool(&body.name, tenant.as_deref()).await;
         let err = AppError::Core(e);
         emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
         return Err(err);
     }
 
+    state.invalidate_tool(tenant.as_deref(), &body.name).await;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Create, &body.name, AuditDecision::Allow, policy_id, None).await;
 
     let resp = ToolResponse::from(&tool);
@@ -775,7 +798,7 @@ pub async fn get_tool(
             return Err(e);
         }
     };
-    let tool = state.metadata.get_tool(&name).await?
+    let tool = state.metadata.get_tool(&name, user.tenant.as_deref()).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("tool '{name}'")))?;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Read, &name, AuditDecision::Allow, policy_id, None).await;
     let rev = tool.revision.unwrap_or(0);
@@ -814,7 +837,8 @@ pub async fn update_tool(
 
     let header_rev = parse_if_match(&headers)?;
 
-    let mut tool = state.metadata.get_tool(&name).await?
+    let tenant = user.tenant.clone();
+    let mut tool = state.metadata.get_tool(&name, tenant.as_deref()).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("tool '{name}'")))?;
 
     let expected = header_rev.or(body.revision);
@@ -825,6 +849,7 @@ pub async fn update_tool(
             return Err(err);
         }
     }
+    let prev_revision = tool.revision.unwrap_or(0);
 
     let now = Utc::now();
     let prev_created = tool.created_at;
@@ -861,12 +886,17 @@ pub async fn update_tool(
         || prev_secret_refs != tool.secret_refs
         || prev_resources != tool.resources;
 
-    let new_rev = tool.revision.unwrap_or(0) + 1;
+    let new_rev = prev_revision + 1;
     tool.revision = Some(new_rev);
     tool.updated_at = Some(now);
     tool.created_at = prev_created;
+    tool.tenant.clone_from(&tenant);
 
-    state.metadata.put_tool(&tool).await?;
+    if let Err(e) = state.metadata.update_tool_cas(&tool, prev_revision).await {
+        let err = AppError::Core(e);
+        emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Update, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
+        return Err(err);
+    }
 
     if deployment_changed {
         let spec = DeploymentSpec {
@@ -882,6 +912,7 @@ pub async fn update_tool(
         }
     }
 
+    state.invalidate_tool(tenant.as_deref(), &name).await;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Update, &name, AuditDecision::Allow, policy_id, None).await;
     Ok((
         StatusCode::OK,
@@ -905,7 +936,8 @@ pub async fn delete_tool(
         }
     };
 
-    let existing = state.metadata.get_tool(&name).await?;
+    let tenant = user.tenant.clone();
+    let existing = state.metadata.get_tool(&name, tenant.as_deref()).await?;
     let Some(existing) = existing else {
         let err = AppError::Core(mcp_oxide_core::Error::NotFound(format!("tool '{name}'")));
         emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Delete, &name, AuditDecision::Deny, policy_id, Some(&err.to_string())).await;
@@ -935,7 +967,8 @@ pub async fn delete_tool(
         }
     }
 
-    state.metadata.delete_tool(&name).await?;
+    state.metadata.delete_tool(&name, tenant.as_deref()).await?;
+    state.invalidate_tool(tenant.as_deref(), &name).await;
     emit_audit(&state, &trace_id, &user, CpKind::Tool, CpVerb::Delete, &name, AuditDecision::Allow, policy_id, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -968,7 +1001,7 @@ pub async fn get_adapter_status(
     };
 
     // 404 if the caller asks about an adapter that doesn't exist.
-    let _ = state.metadata.get_adapter(&name).await?
+    let _ = state.metadata.get_adapter(&name, user.tenant.as_deref()).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("adapter '{name}'")))?;
 
     let handle = handle_for(&name);
@@ -998,7 +1031,7 @@ pub async fn get_tool_status(
         }
     };
 
-    let _ = state.metadata.get_tool(&name).await?
+    let _ = state.metadata.get_tool(&name, user.tenant.as_deref()).await?
         .ok_or_else(|| mcp_oxide_core::Error::NotFound(format!("tool '{name}'")))?;
 
     let handle = handle_for(&name);

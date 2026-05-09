@@ -5,12 +5,14 @@
 use mcp_oxide_core::{
     adapter::{Adapter, Endpoint, ImageRef},
     providers::{Filter, MetadataStore},
+    Error,
 };
 use mcp_oxide_metadata::SqliteMetadataStore;
 
-fn sample_adapter(name: &str, tags: &[&str]) -> Adapter {
+fn sample_adapter(name: &str, tenant: Option<&str>, tags: &[&str]) -> Adapter {
     Adapter {
         name: name.into(),
+        tenant: tenant.map(ToString::to_string),
         description: Some("test".into()),
         image: ImageRef {
             reference: "example:1".into(),
@@ -39,40 +41,49 @@ fn sample_adapter(name: &str, tags: &[&str]) -> Adapter {
 async fn sqlite_adapter_crud_roundtrip() {
     let store = SqliteMetadataStore::connect("sqlite::memory:").await.unwrap();
 
-    let a = sample_adapter("demo", &["public"]);
+    let a = sample_adapter("demo", None, &["public"]);
     store.put_adapter(&a).await.unwrap();
 
-    let got = store.get_adapter("demo").await.unwrap().unwrap();
+    let got = store.get_adapter("demo", None).await.unwrap().unwrap();
     assert_eq!(got.name, "demo");
     assert_eq!(got.upstream.as_deref(), Some("http://example.local/mcp"));
     assert_eq!(got.revision, Some(1));
 
-    // Update with bumped revision.
+    // Atomic update with the correct expected revision succeeds.
     let mut a2 = got.clone();
     a2.description = Some("updated".into());
     a2.revision = Some(2);
-    store.put_adapter(&a2).await.unwrap();
+    store.update_adapter_cas(&a2, 1).await.unwrap();
 
-    let got2 = store.get_adapter("demo").await.unwrap().unwrap();
+    let got2 = store.get_adapter("demo", None).await.unwrap().unwrap();
     assert_eq!(got2.description.as_deref(), Some("updated"));
     assert_eq!(got2.revision, Some(2));
+
+    // Stale CAS fails with Conflict.
+    let mut a3 = got2.clone();
+    a3.description = Some("racy".into());
+    a3.revision = Some(3);
+    assert!(matches!(
+        store.update_adapter_cas(&a3, 1).await,
+        Err(Error::Conflict(_))
+    ));
 
     // List.
     let all = store.list_adapters(&Filter::default()).await.unwrap();
     assert_eq!(all.len(), 1);
 
     // Delete.
-    store.delete_adapter("demo").await.unwrap();
-    assert!(store.get_adapter("demo").await.unwrap().is_none());
+    store.delete_adapter("demo", None).await.unwrap();
+    assert!(store.get_adapter("demo", None).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn sqlite_list_filters_by_tag() {
     let store = SqliteMetadataStore::connect("sqlite::memory:").await.unwrap();
 
-    store.put_adapter(&sample_adapter("a", &["public"])).await.unwrap();
-    store.put_adapter(&sample_adapter("b", &["private", "mutating"])).await.unwrap();
-    store.put_adapter(&sample_adapter("c", &["public", "mutating"])).await.unwrap();
+    store.put_adapter(&sample_adapter("a", None, &["public"])).await.unwrap();
+    store.put_adapter(&sample_adapter("b", None, &["private", "mutating"])).await.unwrap();
+    store.put_adapter(&sample_adapter("c", None, &["public", "mutating"])).await.unwrap();
 
     let public_only = store
         .list_adapters(&Filter {
@@ -104,6 +115,60 @@ async fn sqlite_list_filters_by_tag() {
 }
 
 #[tokio::test]
+async fn sqlite_cross_tenant_isolation() {
+    let store = SqliteMetadataStore::connect("sqlite::memory:").await.unwrap();
+
+    // Same name in two tenants — both must coexist.
+    store.put_adapter(&sample_adapter("weather", Some("acme"), &["public"])).await.unwrap();
+    store.put_adapter(&sample_adapter("weather", Some("other"), &["public"])).await.unwrap();
+
+    // Acme sees their adapter; "other" sees their own; a third tenant sees nothing.
+    let acme = store.get_adapter("weather", Some("acme")).await.unwrap().unwrap();
+    assert_eq!(acme.tenant.as_deref(), Some("acme"));
+    let other = store.get_adapter("weather", Some("other")).await.unwrap().unwrap();
+    assert_eq!(other.tenant.as_deref(), Some("other"));
+    assert!(store.get_adapter("weather", Some("nope")).await.unwrap().is_none());
+
+    // Tenant-scoped list returns only that tenant's row.
+    let f = Filter { tenant: Some("acme".into()), tags: vec![] };
+    let rows = store.list_adapters(&f).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tenant.as_deref(), Some("acme"));
+
+    // Delete in one tenant doesn't affect the other.
+    store.delete_adapter("weather", Some("acme")).await.unwrap();
+    assert!(store.get_adapter("weather", Some("acme")).await.unwrap().is_none());
+    assert!(store.get_adapter("weather", Some("other")).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_writers_no_locked_errors() {
+    // WAL + busy_timeout should make many concurrent writers Just Work.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("mcp-oxide-conc-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let store = std::sync::Arc::new(SqliteMetadataStore::connect(&url).await.unwrap());
+
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            store
+                .put_adapter(&sample_adapter(&format!("a{i}"), None, &["t"]))
+                .await
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+
+    let all = store.list_adapters(&Filter::default()).await.unwrap();
+    assert_eq!(all.len(), 20);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn sqlite_persists_across_reconnect() {
     // File-backed sqlite: ensure a row survives closing + reopening the pool.
     let dir = std::env::temp_dir();
@@ -116,13 +181,13 @@ async fn sqlite_persists_across_reconnect() {
     {
         let store = SqliteMetadataStore::connect(&url).await.unwrap();
         store
-            .put_adapter(&sample_adapter("persist", &["t"]))
+            .put_adapter(&sample_adapter("persist", None, &["t"]))
             .await
             .unwrap();
     }
     {
         let store = SqliteMetadataStore::connect(&url).await.unwrap();
-        let got = store.get_adapter("persist").await.unwrap().unwrap();
+        let got = store.get_adapter("persist", None).await.unwrap().unwrap();
         assert_eq!(got.name, "persist");
     }
 

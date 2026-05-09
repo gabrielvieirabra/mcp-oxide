@@ -213,6 +213,7 @@ mod tests {
             resource: Resource {
                 kind: ResourceKind::Tool,
                 name: target,
+                tenant: None,
                 tags,
                 required_roles: vec![],
             },

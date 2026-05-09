@@ -30,6 +30,10 @@ pub struct Action<'a> {
 pub struct Resource<'a> {
     pub kind: ResourceKind,
     pub name: &'a str,
+    /// Owning tenant of the resource. Used by the policy engine to enforce
+    /// cross-tenant isolation: `user.tenant != resource.tenant` should deny.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

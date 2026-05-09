@@ -18,6 +18,7 @@ use mcp_oxide_core::{
     tool::Tool,
     Error, Result,
 };
+use futures::stream::StreamExt;
 use mcp_oxide_mcp::jsonrpc::{ErrorObject, Request as JsonRequest, Response as JsonResponse};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -43,6 +44,9 @@ const JSONRPC_UPSTREAM_TIMEOUT: i32 = -32005;
 const MAX_TOOLS_PAGE_SIZE: usize = 200;
 /// Default page size when the client doesn't ask for one.
 const DEFAULT_TOOLS_PAGE_SIZE: usize = 50;
+/// Concurrency cap for per-tool visibility authz. Keeps a fan-out to a
+/// remote policy engine (Phase 5 OPA) bounded.
+const VISIBILITY_PARALLELISM: usize = 32;
 
 /// Handle `POST /mcp` — Tool Gateway Router.
 pub async fn invoke(
@@ -62,9 +66,12 @@ pub async fn invoke(
 
     debug!(method = %rpc.method, id = ?rpc.id, "tool router request");
 
+    let session_id = crate::routes::data_plane_helpers::extract_session_id(&parts.headers);
     let response = match rpc.method.as_str() {
         "tools/list" => handle_tools_list(&state, &user, &trace_id, &rpc).await,
-        "tools/call" => handle_tools_call(&state, &user, &trace_id, &rpc, &body).await,
+        "tools/call" => {
+            handle_tools_call(&state, &user, &trace_id, &rpc, &body, session_id.as_ref()).await
+        }
         "ping" => Ok(JsonResponse {
             jsonrpc: "2.0".into(),
             id: rpc.id.clone(),
@@ -186,19 +193,33 @@ async fn handle_tools_list(
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
 
-    let all = state
-        .metadata
-        .list_tools(&mcp_oxide_core::providers::Filter::default())
-        .await?;
+    // Push the tenant filter into the store so SQL can use the index and
+    // we don't pay per-tool authz cost just to discard cross-tenant rows.
+    let filter = mcp_oxide_core::providers::Filter {
+        tenant: user.tenant.clone(),
+        tags: Vec::new(),
+    };
+    let all = state.metadata.list_tools(&filter).await?;
 
-    // B3: filter by per-tool visibility. A tool the caller cannot call should
+    // B3: filter by per-tool visibility. A tool the caller cannot call must
     // not appear in their tools/list (information disclosure).
-    let mut visible: Vec<&Tool> = Vec::with_capacity(all.len());
-    for t in &all {
-        if can_call_tool(state, user, t).await {
-            visible.push(t);
-        }
-    }
+    //
+    // Authz can be remote (OPA sidecar in Phase 5), so a sequential loop
+    // over N tools turns into N round-trips on a hot endpoint. Run the
+    // checks with bounded concurrency: keeps OPA happy while not blocking
+    // on a single slow decision.
+    let visible: Vec<Tool> = futures::stream::iter(all.into_iter())
+        .map(|t| async move {
+            let ok = can_call_tool(state, user, &t).await;
+            (ok, t)
+        })
+        .buffer_unordered(VISIBILITY_PARALLELISM)
+        .filter_map(|(ok, t)| async move { ok.then_some(t) })
+        .collect::<Vec<_>>()
+        .await;
+    // Stable ordering on the wire so cursors stay meaningful.
+    let mut visible = visible;
+    visible.sort_by(|a, b| a.name.cmp(&b.name));
 
     let end = (cursor_start + page_size).min(visible.len());
     let page = &visible[cursor_start.min(visible.len())..end];
@@ -274,6 +295,7 @@ async fn handle_tools_call(
     trace_id: &str,
     rpc: &JsonRequest,
     raw_body: &[u8],
+    session_id: Option<&mcp_oxide_core::session::SessionId>,
 ) -> Result<JsonResponse> {
     let params = rpc.params.clone().ok_or_else(|| {
         Error::InvalidRequest("tools/call requires params".into())
@@ -290,7 +312,7 @@ async fn handle_tools_call(
     // Authz must run BEFORE the deployment-endpoint lookup so an
     // unauthorized caller can't use response-code differences to probe for
     // tool existence.
-    let tool = match state.metadata.get_tool(&tool_name).await {
+    let tool = match state.metadata.get_tool(&tool_name, user.tenant.as_deref()).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             emit_audit(
@@ -347,30 +369,34 @@ async fn handle_tools_call(
         }
     };
 
-    // Resolve the deployment endpoint. If the caller is authorized but no
-    // endpoint is ready, return UpstreamUnavailable rather than a spurious
-    // NotFound.
-    let endpoint_url = match state.deployment.endpoints(&crate::routes::control_plane_helpers::handle_for(&tool.name)).await {
-        Ok(eps) if !eps.is_empty() => eps.into_iter().next().unwrap().url,
-        _ => {
-            let msg = "no ready endpoint for tool".to_string();
-            emit_audit(
-                state,
-                trace_id,
-                user,
-                "tools/call",
-                "tool",
-                &tool.name,
-                AuditDecision::Allow,
-                authz.policy_id.clone(),
-                0,
-                "upstream_unavailable",
-                &request_hash,
-                Some(&msg),
-            )
-            .await;
-            return Err(Error::UpstreamUnavailable(msg));
-        }
+    // Resolve the deployment endpoint via the cached path so a busy
+    // tools/call hot loop doesn't hit the deployment provider on every
+    // call. Tenant scoping is preserved by the cache key. Session
+    // affinity (if requested by the caller) keeps a session pinned to the
+    // same backend replica.
+    let resolved = state
+        .resolve_tool_endpoint_with_session(&tool.name, user.tenant.as_deref(), session_id)
+        .await
+        .ok()
+        .flatten();
+    let Some((_t, endpoint_url)) = resolved else {
+        let msg = "no ready endpoint for tool".to_string();
+        emit_audit(
+            state,
+            trace_id,
+            user,
+            "tools/call",
+            "tool",
+            &tool.name,
+            AuditDecision::Allow,
+            authz.policy_id.clone(),
+            0,
+            "upstream_unavailable",
+            &request_hash,
+            Some(&msg),
+        )
+        .await;
+        return Err(Error::UpstreamUnavailable(msg));
     };
 
     // Forward.
